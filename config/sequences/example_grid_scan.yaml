@@ -1,0 +1,49 @@
+# Example Capture Sequence
+# Defines a grid of positions for both cameras.
+# Load via the orchestrator or publish to config/sequence/active.
+
+sequence_id: "grid-scan-001"
+name: "5x5 Grid Scan — Both Cameras"
+mode: "sequential"  # sequential | parallel
+repeat_count: 1
+
+steps:
+  # Camera 1 — 5 positions along axis A, 5 along axis B = 25 captures
+  - cam_id: cam1
+    position: { drive_a: 0.0, drive_b: 0.0 }
+    settling_delay_ms: 150
+
+  - cam_id: cam1
+    position: { drive_a: 10.0, drive_b: 0.0 }
+    settling_delay_ms: 150
+
+  - cam_id: cam1
+    position: { drive_a: 20.0, drive_b: 0.0 }
+    settling_delay_ms: 150
+
+  - cam_id: cam1
+    position: { drive_a: 30.0, drive_b: 0.0 }
+    settling_delay_ms: 150
+
+  - cam_id: cam1
+    position: { drive_a: 40.0, drive_b: 0.0 }
+    settling_delay_ms: 150
+
+  - cam_id: cam1
+    position: { drive_a: 0.0, drive_b: 10.0 }
+    settling_delay_ms: 150
+
+  - cam_id: cam1
+    position: { drive_a: 10.0, drive_b: 10.0 }
+    settling_delay_ms: 150
+
+  # ... extend to full 5x5 grid
+
+  # Camera 2 — same pattern (or different, depending on specimen)
+  - cam_id: cam2
+    position: { drive_a: 0.0, drive_b: 0.0 }
+    settling_delay_ms: 200  # Cam2 drives may need more settling
+
+  - cam_id: cam2
+    position: { drive_a: 10.0, drive_b: 0.0 }
+    settling_delay_ms: 200

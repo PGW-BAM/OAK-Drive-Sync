@@ -1,0 +1,34 @@
+# Systemd service for the Pi drive controller
+# Install: sudo cp deploy/oak-drive-controller.service /etc/systemd/system/
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable --now oak-drive-controller
+
+[Unit]
+Description=OAK-Drive-Sync Pi Drive Controller
+After=network-online.target mosquitto.service
+Wants=network-online.target
+Requires=mosquitto.service
+
+[Service]
+Type=exec
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/oak-drive-sync
+ExecStart=/home/pi/.local/bin/uv run oak-pi run --config config/drive_pinmap.yaml
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# GPIO access
+SupplementaryGroups=gpio
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Watchdog: systemd will restart if no heartbeat within 30s
+WatchdogSec=30
+NotifyAccess=all
+
+[Install]
+WantedBy=multi-user.target

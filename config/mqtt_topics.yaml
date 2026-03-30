@@ -1,0 +1,131 @@
+# MQTT Topic Schema — Canonical Reference
+# This file documents all topics. The actual topic strings
+# are defined in src/shared/mqtt_topics.py (single source of truth).
+
+topics:
+
+  # ── Commands (Windows → Pi) ──────────────────
+  - topic: "cmd/drives/{cam_id}/move"
+    direction: "win → pi"
+    qos: 1
+    retained: false
+    payload_model: MoveCommand
+    description: >
+      Move a specific drive axis to an absolute position.
+      cam_id: cam1 | cam2
+
+  - topic: "cmd/drives/{cam_id}/home"
+    direction: "win → pi"
+    qos: 1
+    retained: false
+    payload_model: HomeCommand
+    description: >
+      Home a drive axis (move toward limit switch, reset zero).
+
+  - topic: "cmd/drives/{cam_id}/stop"
+    direction: "win → pi"
+    qos: 1
+    retained: false
+    payload_model: StopCommand
+    description: >
+      Emergency stop. If drive_axis is null, stops all drives on that camera.
+
+  # ── Drive Status (Pi → Windows) ──────────────
+  - topic: "status/drives/{cam_id}/position"
+    direction: "pi → win"
+    qos: 1
+    retained: true
+    payload_model: DrivePosition
+    description: >
+      Current position and state of each drive. Published on every state
+      change (idle→moving, moving→reached, etc.) and periodically while
+      idle. Retained so reconnecting clients get last known position.
+
+  # ── Camera Status (Windows internal) ─────────
+  - topic: "status/cameras/{cam_id}/state"
+    direction: "win → broker"
+    qos: 1
+    retained: true
+    payload_model: CameraStatus
+    description: >
+      DepthAI device state as detected by the Windows controller.
+      Published on state change and every 10s while stable.
+
+  # ── Health Beacons ───────────────────────────
+  - topic: "health/pi"
+    direction: "pi → broker"
+    qos: 0
+    retained: false
+    lwt: true
+    lwt_payload: '{"online": false, "timestamp": "<auto>"}'
+    payload_model: PiHealth
+    interval_s: 2
+    description: >
+      Pi heartbeat. Includes CPU temperature, uptime, and drive states.
+      LWT ensures offline detection if Pi disconnects ungracefully.
+
+  - topic: "health/win_controller"
+    direction: "win → broker"
+    qos: 0
+    retained: false
+    lwt: true
+    lwt_payload: '{"online": false, "timestamp": "<auto>"}'
+    payload_model: WinControllerHealth
+    interval_s: 2
+    description: >
+      Windows controller heartbeat.
+
+  - topic: "health/cameras/{cam_id}"
+    direction: "win → broker"
+    qos: 0
+    retained: false
+    payload_model: CameraHealth
+    interval_s: 5
+    description: >
+      Per-camera health status from DepthAI device queries.
+
+  # ── Error Events ─────────────────────────────
+  - topic: "error/drives/{cam_id}"
+    direction: "pi → broker"
+    qos: 1
+    retained: false
+    payload_model: DriveError
+    description: >
+      Drive fault events (stall, limit switch hit unexpectedly, GPIO issues).
+      Triggers monitoring alerts.
+
+  - topic: "error/cameras/{cam_id}"
+    direction: "win → broker"
+    qos: 1
+    retained: false
+    payload_model: CameraError
+    description: >
+      Camera errors (disconnect, capture failure, pipeline crash).
+
+  - topic: "error/orchestration/{event}"
+    direction: "win → broker"
+    qos: 1
+    retained: false
+    payload_model: OrchestrationError
+    description: >
+      Workflow-level errors. event: timeout | sequence_abort | unknown
+
+  # ── Monitoring ───────────────────────────────
+  - topic: "monitoring/connectivity"
+    direction: "monitor → broker"
+    qos: 1
+    retained: true
+    payload_model: ConnectivityState
+    description: >
+      Aggregated system connectivity state. Published by the monitoring
+      module every second. Retained for dashboard/UI quick load.
+
+  # ── Configuration ────────────────────────────
+  - topic: "config/sequence/active"
+    direction: "win → broker"
+    qos: 1
+    retained: true
+    payload_model: CaptureSequence
+    description: >
+      The currently active capture sequence definition.
+      Published when a new sequence is started.

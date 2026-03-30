@@ -1,0 +1,50 @@
+# Drive GPIO Pin Mappings — Raspberry Pi 5
+# Each camera has 2 drive axes (a and b).
+# Adjust pin numbers to match your wiring.
+
+drives:
+  cam1:
+    axis_a:
+      step_pin: 17        # GPIO17 — step/pulse signal
+      dir_pin: 27         # GPIO27 — direction signal
+      enable_pin: 22      # GPIO22 — driver enable (active low)
+      limit_min_pin: 5    # GPIO5  — minimum limit switch (NC, pulled high)
+      limit_max_pin: 6    # GPIO6  — maximum limit switch (NC, pulled high)
+      steps_per_unit: 200 # Steps per degree/mm (depends on mechanics)
+      max_speed: 1000     # Max steps/second
+      homing_speed: 200   # Steps/second during homing
+      homing_direction: -1 # -1 = toward min limit
+    axis_b:
+      step_pin: 23
+      dir_pin: 24
+      enable_pin: 25
+      limit_min_pin: 12
+      limit_max_pin: 16
+      steps_per_unit: 200
+      max_speed: 1000
+      homing_speed: 200
+      homing_direction: -1
+  cam2:
+    axis_a:
+      step_pin: 20
+      dir_pin: 21
+      enable_pin: 26
+      limit_min_pin: 19
+      limit_max_pin: 13
+      steps_per_unit: 200
+      max_speed: 1000
+      homing_speed: 200
+      homing_direction: -1
+    axis_b:
+      step_pin: 0
+      dir_pin: 1
+      enable_pin: 7
+      limit_min_pin: 8
+      limit_max_pin: 11
+      steps_per_unit: 200
+      max_speed: 1000
+      homing_speed: 200
+      homing_direction: -1
+
+# Settling time after drive reaches position (ms)
+settling_delay_ms: 150

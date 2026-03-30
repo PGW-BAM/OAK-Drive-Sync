@@ -1,0 +1,36 @@
+{
+  "plugins": ["thedotmack/claude-mem"],
+  "permissions": {
+    "allow": [
+      "Bash(uv *)",
+      "Bash(python *)",
+      "Bash(pytest *)",
+      "Bash(mosquitto_pub *)",
+      "Bash(mosquitto_sub *)",
+      "Bash(cat *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(rm *)",
+      "Bash(git *)",
+      "Bash(pip install *)",
+      "Bash(uv pip install *)",
+      "Bash(uv run *)",
+      "Bash(uv sync)",
+      "Bash(ssh pi@* *)"
+    ]
+  },
+  "agents": {
+    "pi-controller": ".claude/agents/pi-controller.md",
+    "cam-controller": ".claude/agents/cam-controller.md",
+    "mqtt-infra": ".claude/agents/mqtt-infra.md",
+    "monitoring": ".claude/agents/monitoring.md",
+    "integration-test": ".claude/agents/integration-test.md"
+  }
+}

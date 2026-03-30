@@ -1,0 +1,23 @@
+# Mosquitto MQTT Broker — custom config override
+# Install: sudo cp deploy/mosquitto-oak.service /etc/systemd/system/
+# This overrides the default Mosquitto unit to use our config.
+
+[Unit]
+Description=Mosquitto MQTT Broker (OAK-Drive-Sync)
+After=network-online.target
+Wants=network-online.target
+Documentation=https://mosquitto.org/man/mosquitto-8.html
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=mosquitto
+Group=mosquitto
+ExecStartPre=/usr/sbin/mosquitto -t -c /etc/mosquitto/mosquitto.conf
+ExecStart=/usr/sbin/mosquitto -c /etc/mosquitto/mosquitto.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

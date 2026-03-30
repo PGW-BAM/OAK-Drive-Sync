@@ -1,0 +1,61 @@
+Subject: [OAK-Drive-Sync] {{ severity | upper }}: {{ alert_type }} — {{ component }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  OAK-Drive-Sync Alert Notification
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Severity:   {{ severity | upper }}
+Alert Type: {{ alert_type }}
+Component:  {{ component }}
+Time (UTC): {{ timestamp }}
+
+── Description ──────────────────────────
+
+{{ message }}
+
+── System State Snapshot ────────────────
+
+Pi Controller:    {{ "ONLINE" if system_state.pi_online else "OFFLINE" }}
+MQTT Broker:      {{ "CONNECTED" if system_state.broker_connected else "DISCONNECTED" }}
+{% for cam_id, state in system_state.cameras.items() %}
+Camera {{ cam_id }}:      {{ state | upper }}
+{% endfor %}
+{% for drive_id, state in system_state.drives.items() %}
+Drive {{ drive_id }}:  {{ state | upper }}
+{% endfor %}
+
+── Suggested Actions ────────────────────
+
+{% if alert_type == "pi_offline" %}
+• Check Raspberry Pi power supply and network cable
+• Verify Mosquitto broker is running: sudo systemctl status mosquitto
+• Check Pi drive controller: sudo systemctl status oak-drive-controller
+• Try SSH: ssh pi@{{ pi_ip | default("192.168.1.100") }}
+{% elif alert_type == "camera_offline" %}
+• Check PoE++ switch port LEDs for the affected camera
+• Verify camera power draw is within PoE budget
+• Restart DepthAI pipeline on the Windows controller
+• Try: python -c "import depthai; print(depthai.Device.getAllAvailableDevices())"
+{% elif alert_type == "broker_offline" %}
+• The MQTT broker on the Pi may have crashed
+• SSH into Pi and check: sudo systemctl status mosquitto
+• Restart if needed: sudo systemctl restart mosquitto
+• Check logs: sudo tail -50 /var/log/mosquitto/mosquitto.log
+{% elif alert_type == "drive_fault" %}
+• A mechanical drive has reported a fault (stall or limit switch)
+• Inspect the physical drive mechanism for obstructions
+• Check wiring between Pi GPIO and motor driver
+• After fixing, send a home command to recalibrate
+{% elif alert_type == "sequence_aborted" %}
+• The capture sequence was stopped due to repeated errors
+• Check the error log for the root cause
+• Resolve the underlying issue, then restart the sequence
+{% else %}
+• Check system logs for details
+• Verify all network connections are stable
+• Restart affected components if necessary
+{% endif %}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+This is an automated alert from OAK-Drive-Sync.
+To change notification settings, edit config/monitoring_config.yaml.

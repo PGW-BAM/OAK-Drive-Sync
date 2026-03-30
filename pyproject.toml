@@ -1,0 +1,78 @@
+[project]
+name = "oak-drive-sync"
+version = "0.1.0"
+description = "Synchronized OAK-D camera capture with MQTT-coordinated mechanical positioning drives"
+requires-python = ">=3.11"
+readme = "README.md"
+
+dependencies = [
+    # MQTT
+    "aiomqtt>=2.0.0",
+    # Data models
+    "pydantic>=2.5.0",
+    # Logging
+    "structlog>=24.0.0",
+    # Config
+    "pyyaml>=6.0",
+    # Email
+    "aiosmtplib>=3.0.0",
+    "jinja2>=3.1.0",
+    # Database (monitoring history)
+    "aiosqlite>=0.20.0",
+    # CLI
+    "click>=8.1.0",
+]
+
+[project.optional-dependencies]
+# Install on Raspberry Pi only
+pi = [
+    "gpiozero>=2.0",
+    "lgpio>=0.2.0",
+]
+# Install on Windows only
+camera = [
+    "depthai>=2.25.0",
+    "opencv-python>=4.9.0",
+    "numpy>=1.26.0",
+]
+# All dependencies (development)
+dev = [
+    "oak-drive-sync[pi,camera]",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+]
+
+[project.scripts]
+oak-pi = "src.pi_controller.main:cli"
+oak-cam = "src.win_controller.main:cli"
+oak-monitor = "src.monitoring.main:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "e2e: end-to-end tests requiring simulators",
+    "hardware: tests requiring real hardware (skip in CI)",
+]

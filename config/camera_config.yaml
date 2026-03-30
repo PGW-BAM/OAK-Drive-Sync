@@ -1,0 +1,50 @@
+# Camera Configuration — Luxonis OAK-D 4 Pro
+# Cameras are connected via PoE++ through the network switch.
+
+cameras:
+  cam1:
+    mx_id: ""            # Fill with actual MxID (run: python -c "import depthai; print(depthai.Device.getAllAvailableDevices())")
+    ip_address: ""       # Fill with PoE IP if using static assignment
+    friendly_name: "Camera 1"
+    capture:
+      resolution: "4K"   # Options: 4K, 1080P, 720P (maps to ColorCameraProperties.SensorResolution)
+      format: "png"      # png or jpg
+      quality: 95        # JPEG quality (1-100), ignored for PNG
+      auto_exposure: true
+      auto_focus: true
+    stream:
+      preview_size: [640, 480]  # Preview window resolution
+      fps: 30
+
+  cam2:
+    mx_id: ""
+    ip_address: ""
+    friendly_name: "Camera 2"
+    capture:
+      resolution: "4K"
+      format: "png"
+      quality: 95
+      auto_exposure: true
+      auto_focus: true
+    stream:
+      preview_size: [640, 480]
+      fps: 30
+
+# Storage paths (relative to project root)
+storage:
+  capture_dir: "data/captures"  # {capture_dir}/{cam_id}/{sequence_id}/{timestamp}.{format}
+  max_disk_usage_gb: 50         # Alert when disk usage exceeds this
+
+# MQTT broker connection (from Windows machine perspective)
+mqtt:
+  broker_host: "192.168.1.100"  # Pi IP address — adjust to your network
+  broker_port: 1883
+  client_id: "oak-drive-sync-win"
+
+# Orchestration defaults
+orchestration:
+  move_timeout_s: 30
+  capture_timeout_s: 10
+  settling_delay_ms: 150
+  retry_count: 1
+  mode: "sequential"  # sequential or parallel
