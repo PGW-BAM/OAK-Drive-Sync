@@ -1,8 +1,9 @@
 """
 Pi Drive Controller — Main Entry Point
 
-Manages 4 mechanical drives (2 per camera) via GPIO,
+Manages 4 mechanical drives (2 GPIO linear + 2 Tinkerforge steppers),
 coordinated through MQTT commands from the Windows controller.
+Includes a NiceGUI web interface for non-programmers.
 """
 
 from __future__ import annotations
@@ -14,15 +15,14 @@ import click
 import structlog
 import yaml
 
+from src.pi_controller.drives.base import BaseDrive, DriveState
+from src.pi_controller.drives.gpio_drive import GPIODrive
+from src.pi_controller.drives.tinkerforge_drive import TinkerforgeDrive
 from src.shared.models import (
     DriveError,
-    DriveErrorType,
     DrivePosition,
-    DriveState,
-    HomeCommand,
-    MoveCommand,
     PiHealth,
-    StopCommand,
+    PositionPreset,
 )
 from src.shared.mqtt_client import MQTTClient
 from src.shared.mqtt_topics import (
@@ -39,153 +39,257 @@ from src.shared.mqtt_topics import (
 logger = structlog.get_logger()
 
 
+# ──────────────────────────────────────────────
+# Drive Factory
+# ──────────────────────────────────────────────
+
+def create_drive(cam_id: str, axis: str, cfg: dict) -> BaseDrive:
+    """Create a drive instance from config."""
+    drive_type = cfg.pop("type")
+    if drive_type == "gpio":
+        return GPIODrive(cam_id, axis, **cfg)
+    elif drive_type == "tinkerforge":
+        return TinkerforgeDrive(cam_id, axis, **cfg)
+    else:
+        raise ValueError(f"Unknown drive type: {drive_type}")
+
+
+# ──────────────────────────────────────────────
+# Drive Manager
+# ──────────────────────────────────────────────
+
 class DriveManager:
-    """Manages all drives for one or more cameras."""
+    """Manages all drives and dispatches MQTT commands."""
 
     def __init__(self, config: dict, mqtt: MQTTClient) -> None:
         self.config = config
         self.mqtt = mqtt
-        self.drives: dict[str, dict] = {}  # "cam1:a" → drive config + state
+        self.drives: dict[str, BaseDrive] = {}
+        self.settling_delay_ms: int = config.get("settling_delay_ms", 150)
+        self._sequence_running = False
+        self._sequence_stop = asyncio.Event()
         self._init_drives()
 
     def _init_drives(self) -> None:
-        """Initialize drive state from config."""
         for cam_id, axes in self.config["drives"].items():
-            for axis_name, axis_cfg in axes.items():
-                if axis_name.startswith("axis_"):
-                    axis_letter = axis_name.split("_")[1]
-                    key = f"{cam_id}:{axis_letter}"
-                    self.drives[key] = {
-                        **axis_cfg,
-                        "cam_id": cam_id,
-                        "axis": axis_letter,
-                        "current_position": 0.0,
-                        "state": DriveState.IDLE,
-                    }
-        logger.info("drives.initialized", count=len(self.drives))
+            for axis_key, axis_cfg in axes.items():
+                # Support both "axis_a" and "a" formats
+                axis = axis_key.split("_")[-1] if "_" in axis_key else axis_key
+                cfg = dict(axis_cfg)  # copy so we don't mutate config
+                drive = create_drive(cam_id, axis, cfg)
+                self.drives[drive.key] = drive
+        logger.info("drives.initialized", count=len(self.drives), keys=list(self.drives.keys()))
+
+    async def setup_all(self) -> None:
+        for drive in self.drives.values():
+            await drive.setup()
+
+    async def cleanup_all(self) -> None:
+        for drive in self.drives.values():
+            await drive.cleanup()
 
     async def handle_move(self, topic_str: str, payload: dict) -> None:
-        """Handle a move command from MQTT."""
-        # Extract cam_id from topic: cmd/drives/{cam_id}/move
         parts = topic_str.split("/")
         cam_id = parts[2]
-        cmd = MoveCommand.model_validate(payload)
-        key = f"{cam_id}:{cmd.drive_axis}"
-
+        axis = payload.get("drive_axis", "a")
+        key = f"{cam_id}:{axis}"
         drive = self.drives.get(key)
         if not drive:
             logger.error("drive.unknown", key=key)
             return
 
-        logger.info(
-            "drive.move_start",
-            key=key,
-            target=cmd.target_position,
-            speed=cmd.speed,
-            seq=cmd.sequence_id,
-        )
+        sequence_id = payload.get("sequence_id")
+        target = payload["target_position"]
+        speed = payload.get("speed", 1.0)
 
-        # Update state → moving
-        drive["state"] = DriveState.MOVING
-        await self._publish_position(cam_id, cmd.drive_axis, drive, cmd.sequence_id)
+        logger.info("drive.move_start", key=key, target=target, speed=speed, seq=sequence_id)
 
-        # TODO: Replace with real GPIO step/dir logic
-        # Simulate movement duration based on distance and speed
-        distance = abs(cmd.target_position - drive["current_position"])
-        steps = distance * drive["steps_per_unit"]
-        duration = steps / (drive["max_speed"] * cmd.speed) if cmd.speed > 0 else 0
-        await asyncio.sleep(duration)
+        # Publish moving state
+        await self._publish_position(drive, sequence_id)
 
-        # Update position
-        drive["current_position"] = cmd.target_position
-        drive["state"] = DriveState.REACHED
+        try:
+            await drive.move_to(target, speed)
 
-        # Wait settling time
-        settling_ms = self.config.get("settling_delay_ms", 150)
-        await asyncio.sleep(settling_ms / 1000.0)
+            # Wait settling time
+            await asyncio.sleep(self.settling_delay_ms / 1000.0)
 
-        drive["state"] = DriveState.IDLE
-        await self._publish_position(cam_id, cmd.drive_axis, drive, cmd.sequence_id)
-        logger.info("drive.move_complete", key=key, position=cmd.target_position)
+            # Publish reached state
+            await self._publish_position(drive, sequence_id)
+            logger.info("drive.move_complete", key=key, position=drive.current_position)
+
+        except Exception as exc:
+            logger.error("drive.move_error", key=key, error=str(exc))
+            await self.mqtt.publish(
+                topic(ERROR_DRIVE, cam_id=cam_id),
+                DriveError(
+                    sequence_id=sequence_id,
+                    drive_axis=axis,
+                    error_type="stall",
+                    message=str(exc),
+                ),
+                qos=1,
+            )
+            await self._publish_position(drive, sequence_id)
 
     async def handle_home(self, topic_str: str, payload: dict) -> None:
-        """Handle a home command."""
         parts = topic_str.split("/")
         cam_id = parts[2]
-        cmd = HomeCommand.model_validate(payload)
-        key = f"{cam_id}:{cmd.drive_axis}"
-
+        axis = payload.get("drive_axis", "a")
+        key = f"{cam_id}:{axis}"
         drive = self.drives.get(key)
         if not drive:
             return
 
+        sequence_id = payload.get("sequence_id")
         logger.info("drive.homing", key=key)
-        drive["state"] = DriveState.HOMING
-        await self._publish_position(cam_id, cmd.drive_axis, drive, cmd.sequence_id)
 
-        # TODO: Real homing logic — move toward limit switch at homing_speed
-        await asyncio.sleep(2.0)  # Simulate homing
+        await self._publish_position(drive, sequence_id)
 
-        drive["current_position"] = 0.0
-        drive["state"] = DriveState.IDLE
-        await self._publish_position(cam_id, cmd.drive_axis, drive, cmd.sequence_id)
-        logger.info("drive.homed", key=key)
+        try:
+            await drive.home()
+            await self._publish_position(drive, sequence_id)
+            logger.info("drive.homed", key=key)
+        except Exception as exc:
+            logger.error("drive.home_error", key=key, error=str(exc))
+            await self.mqtt.publish(
+                topic(ERROR_DRIVE, cam_id=cam_id),
+                DriveError(
+                    sequence_id=sequence_id,
+                    drive_axis=axis,
+                    error_type="stall",
+                    message=str(exc),
+                ),
+                qos=1,
+            )
 
     async def handle_stop(self, topic_str: str, payload: dict) -> None:
-        """Handle emergency stop."""
         parts = topic_str.split("/")
         cam_id = parts[2]
-        cmd = StopCommand.model_validate(payload)
+        axis = payload.get("drive_axis")
+        sequence_id = payload.get("sequence_id")
 
-        if cmd.drive_axis:
-            keys = [f"{cam_id}:{cmd.drive_axis}"]
+        if axis:
+            keys = [f"{cam_id}:{axis}"]
         else:
             keys = [k for k in self.drives if k.startswith(f"{cam_id}:")]
 
         for key in keys:
             drive = self.drives.get(key)
             if drive:
-                # TODO: Immediately disable GPIO step output
-                drive["state"] = DriveState.IDLE
-                axis = key.split(":")[1]
-                await self._publish_position(cam_id, axis, drive, cmd.sequence_id)
+                drive.emergency_stop()
+                await self._publish_position(drive, sequence_id)
                 logger.warning("drive.stopped", key=key)
 
-    async def _publish_position(
-        self, cam_id: str, axis: str, drive: dict, sequence_id: str | None = None
-    ) -> None:
+    async def _publish_position(self, drive: BaseDrive, sequence_id: str | None = None) -> None:
         pos = DrivePosition(
             sequence_id=sequence_id,
-            drive_axis=axis,  # type: ignore[arg-type]
-            current_position=drive["current_position"],
-            target_position=None,
-            state=drive["state"],
+            drive_axis=drive.axis,
+            current_position=drive.current_position,
+            target_position=drive.target_position,
+            state=drive.state.value,
         )
         await self.mqtt.publish(
-            topic(STATUS_DRIVE_POSITION, cam_id=cam_id),
+            topic(STATUS_DRIVE_POSITION, cam_id=drive.cam_id),
             pos,
             qos=1,
             retain=True,
         )
 
     def get_drive_states(self) -> dict[str, str]:
-        """Return current state of all drives for health beacon."""
-        return {k: str(v["state"]) for k, v in self.drives.items()}
+        return {k: v.state.value for k, v in self.drives.items()}
 
+    # ──────────────────────────────────────────
+    # Position-based sequence (GUI-driven)
+    # ──────────────────────────────────────────
+
+    async def move_all_to_position(self, preset: PositionPreset) -> None:
+        """Move all 4 drives to a position preset in parallel."""
+        targets = preset.as_drive_targets()
+        tasks = []
+        for key, target_pos in targets.items():
+            drive = self.drives.get(key)
+            if drive:
+                tasks.append(drive.move_to(target_pos))
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def run_sequence(
+        self,
+        positions: list[PositionPreset],
+        dwell_time_ms: int = 500,
+        repeat_count: int = 1,
+    ) -> None:
+        """Run a cyclic capture sequence through positions.
+
+        For each position: move all drives → settle → notify cameras → dwell → next.
+        repeat_count=0 means infinite.
+        """
+        self._sequence_running = True
+        self._sequence_stop.clear()
+        cycle = 0
+
+        logger.info(
+            "sequence.start",
+            positions=len(positions),
+            repeats=repeat_count,
+            dwell_ms=dwell_time_ms,
+        )
+
+        try:
+            while repeat_count == 0 or cycle < repeat_count:
+                if self._sequence_stop.is_set():
+                    break
+                cycle += 1
+                logger.info("sequence.cycle", cycle=cycle)
+
+                for i, preset in enumerate(positions):
+                    if self._sequence_stop.is_set():
+                        break
+
+                    logger.info("sequence.moving_to", position=preset.name, step=i + 1)
+
+                    # Move all drives in parallel
+                    await self.move_all_to_position(preset)
+
+                    # Settling delay
+                    await asyncio.sleep(self.settling_delay_ms / 1000.0)
+
+                    # Publish "reached" for each drive → Windows cameras capture
+                    targets = preset.as_drive_targets()
+                    for key in targets:
+                        drive = self.drives.get(key)
+                        if drive:
+                            await self._publish_position(drive, f"seq-cycle{cycle}-step{i}")
+
+                    logger.info("sequence.position_reached", position=preset.name)
+
+                    # Dwell time (pause at position)
+                    await asyncio.sleep(dwell_time_ms / 1000.0)
+
+        finally:
+            self._sequence_running = False
+            logger.info("sequence.complete", cycles=cycle)
+
+    def stop_sequence(self) -> None:
+        self._sequence_stop.set()
+        for drive in self.drives.values():
+            drive.emergency_stop()
+
+    @property
+    def sequence_running(self) -> bool:
+        return self._sequence_running
+
+
+# ──────────────────────────────────────────────
+# Heartbeat
+# ──────────────────────────────────────────────
 
 async def heartbeat_loop(mqtt: MQTTClient, drive_mgr: DriveManager) -> None:
     """Publish Pi health beacon every 2 seconds."""
-    import os
-
     while True:
         try:
-            # Read CPU temperature (Linux/RPi)
-            cpu_temp = 0.0
-            temp_path = Path("/sys/class/thermal/thermal_zone0/temp")
-            if temp_path.exists():
-                cpu_temp = int(temp_path.read_text().strip()) / 1000.0
-
-            uptime = int(float(Path("/proc/uptime").read_text().split()[0])) if Path("/proc/uptime").exists() else 0
+            cpu_temp = _read_cpu_temp()
+            uptime = _read_uptime()
 
             health = PiHealth(
                 online=True,
@@ -200,20 +304,49 @@ async def heartbeat_loop(mqtt: MQTTClient, drive_mgr: DriveManager) -> None:
         await asyncio.sleep(2.0)
 
 
-async def run_controller(config_path: str, broker_host: str, broker_port: int) -> None:
+def _read_cpu_temp() -> float:
+    temp_path = Path("/sys/class/thermal/thermal_zone0/temp")
+    if temp_path.exists():
+        return int(temp_path.read_text().strip()) / 1000.0
+    return 0.0
+
+
+def _read_uptime() -> int:
+    uptime_path = Path("/proc/uptime")
+    if uptime_path.exists():
+        return int(float(uptime_path.read_text().split()[0]))
+    return 0
+
+
+# ──────────────────────────────────────────────
+# Main entry point
+# ──────────────────────────────────────────────
+
+async def run_controller(
+    config_path: str,
+    broker_host: str | None,
+    broker_port: int | None,
+    gui: bool = True,
+) -> None:
     """Main async entry point."""
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
+    # Override broker settings from CLI if provided
+    broker = config.get("broker", {})
+    host = broker_host or broker.get("host", "localhost")
+    port = broker_port or broker.get("port", 1883)
+
     mqtt = MQTTClient(
-        broker_host=broker_host,
-        broker_port=broker_port,
+        broker_host=host,
+        broker_port=port,
         client_id="oak-pi-drive-controller",
         lwt_topic=HEALTH_PI,
         lwt_payload={"online": False},
     )
 
     drive_mgr = DriveManager(config, mqtt)
+    await drive_mgr.setup_all()
 
     # Register MQTT command handlers
     async def dispatch_command(topic_str: str, payload: dict) -> None:
@@ -226,11 +359,24 @@ async def run_controller(config_path: str, broker_host: str, broker_port: int) -
 
     mqtt.subscribe(SUB_ALL_DRIVE_CMDS, dispatch_command)
 
-    # Run MQTT client and heartbeat concurrently
-    async with asyncio.TaskGroup() as tg:
-        tg.create_task(mqtt.run())
-        tg.create_task(heartbeat_loop(mqtt, drive_mgr))
+    try:
+        tasks: list[asyncio.Task] = []
+        async with asyncio.TaskGroup() as tg:
+            tasks.append(tg.create_task(mqtt.run()))
+            tasks.append(tg.create_task(heartbeat_loop(mqtt, drive_mgr)))
 
+            if gui:
+                # Import GUI here to avoid loading NiceGUI when not needed
+                from src.pi_controller.gui import start_gui
+                gui_cfg = config.get("gui", {})
+                tg.create_task(start_gui(drive_mgr, config, gui_cfg))
+    finally:
+        await drive_mgr.cleanup_all()
+
+
+# ──────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────
 
 @click.group()
 def cli() -> None:
@@ -243,13 +389,14 @@ def cli() -> None:
 
 
 @cli.command()
-@click.option("--config", default="config/drive_pinmap.yaml", help="Drive config file")
-@click.option("--broker-host", default="localhost", help="MQTT broker hostname")
-@click.option("--broker-port", default=1883, type=int, help="MQTT broker port")
-def run(config: str, broker_host: str, broker_port: int) -> None:
+@click.option("--config", default="config/drive_config.yaml", help="Drive config file")
+@click.option("--broker-host", default=None, help="MQTT broker hostname (overrides config)")
+@click.option("--broker-port", default=None, type=int, help="MQTT broker port (overrides config)")
+@click.option("--no-gui", is_flag=True, default=False, help="Disable web GUI")
+def run(config: str, broker_host: str | None, broker_port: int | None, no_gui: bool) -> None:
     """Start the drive controller."""
-    logger.info("pi_controller.starting", config=config, broker=broker_host)
-    asyncio.run(run_controller(config, broker_host, broker_port))
+    logger.info("pi_controller.starting", config=config)
+    asyncio.run(run_controller(config, broker_host, broker_port, gui=not no_gui))
 
 
 if __name__ == "__main__":

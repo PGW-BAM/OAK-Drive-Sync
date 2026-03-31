@@ -187,6 +187,33 @@ class CaptureSequence(BaseModel):
 
 
 # ──────────────────────────────────────────────
+# Position Presets (GUI)
+# ──────────────────────────────────────────────
+
+class PositionPreset(BaseModel):
+    name: str
+    cam1_a: float = 0.0
+    cam1_b: float = 1500.0
+    cam2_a: float = 0.0
+    cam2_b: float = 1500.0
+
+    def as_drive_targets(self) -> dict[str, float]:
+        return {
+            "cam1:a": self.cam1_a,
+            "cam1:b": self.cam1_b,
+            "cam2:a": self.cam2_a,
+            "cam2:b": self.cam2_b,
+        }
+
+
+class SequenceConfig(BaseModel):
+    positions: list[str]  # list of PositionPreset names
+    dwell_time_ms: int = 500  # pause at each position
+    repeat_count: int = 1  # 0 = infinite
+    settling_delay_ms: int = 150
+
+
+# ──────────────────────────────────────────────
 # Email Alert
 # ──────────────────────────────────────────────
 

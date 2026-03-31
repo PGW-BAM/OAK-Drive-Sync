@@ -1,0 +1,23 @@
+# Saved position presets for OAK-Drive-Sync
+# Each position defines all 4 drive targets.
+# Positions are used in sequences for cyclic capture runs.
+
+positions:
+  - name: "Home"
+    cam1_a: 0
+    cam1_b: 1500
+    cam2_a: 0
+    cam2_b: 1500
+
+  - name: "Center"
+    cam1_a: 5000
+    cam1_b: 5500
+    cam2_a: 5000
+    cam2_b: 5500
+
+# Example: add more positions here
+#  - name: "Top Right"
+#    cam1_a: 8000
+#    cam1_b: 8000
+#    cam2_a: 8000
+#    cam2_b: 8000
