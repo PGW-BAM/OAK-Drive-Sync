@@ -1,6 +1,8 @@
 """GPIO stepper drive controller using lgpio.
 
-Controls a linear stepper motor via step/dir pins on the Raspberry Pi 5.
+Controls a linear motor via a single GPIO pin on the Raspberry Pi 5.
+Supports single-pin mode (step_pin only, no dir_pin) for simple linear actuators,
+or step+dir mode for stepper drivers.
 No limit switches for now — position tracked in software, starts at 0 (bottom).
 """
 
@@ -30,7 +32,7 @@ class GPIODrive(BaseDrive):
         axis: str,
         *,
         step_pin: int,
-        dir_pin: int,
+        dir_pin: int | None = None,
         enable_pin: int | None = None,
         steps_per_unit: float = 200.0,
         max_speed: float = 1000.0,
@@ -61,7 +63,8 @@ class GPIODrive(BaseDrive):
         self._gpio_handle = h
 
         lgpio.gpio_claim_output(h, self.step_pin, 0)
-        lgpio.gpio_claim_output(h, self.dir_pin, 0)
+        if self.dir_pin is not None:
+            lgpio.gpio_claim_output(h, self.dir_pin, 0)
         if self.enable_pin is not None:
             lgpio.gpio_claim_output(h, self.enable_pin, 1)  # disabled by default
 
@@ -125,9 +128,10 @@ class GPIODrive(BaseDrive):
 
             self._enable()
 
-            # Set direction
-            dir_val = 1 if direction > 0 else 0
-            lgpio.gpio_write(self._gpio_handle, self.dir_pin, dir_val)
+            # Set direction (only if dir_pin is configured)
+            if self.dir_pin is not None:
+                dir_val = 1 if direction > 0 else 0
+                lgpio.gpio_write(self._gpio_handle, self.dir_pin, dir_val)
 
             try:
                 position_per_step = delta / steps

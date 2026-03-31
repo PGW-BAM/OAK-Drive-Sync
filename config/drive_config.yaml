@@ -10,43 +10,42 @@ settling_delay_ms: 150
 
 drives:
   cam1:
-    axis_a:
+    axis_a:                       # GPIO linear motor — single pin control
       type: gpio
-      step_pin: 15
-      dir_pin: 17
-      # enable_pin: null        # uncomment and set if your driver has an enable pin
-      steps_per_unit: 200       # steps per unit of position — adjust for your motor/gearing
-      max_speed: 1000           # max steps/second
-      max_position: 10000       # user will configure once hardware range is known
-      home_position: 0          # bottom position (start point)
+      step_pin: 15                # GPIO 15 — one motor per pin, no dir_pin needed
+      # dir_pin: null             # uncomment and set if your driver has a direction pin
+      # enable_pin: null          # uncomment and set if your driver has an enable pin
+      steps_per_unit: 200         # steps per unit of position — adjust for your motor/gearing
+      max_speed: 1000             # max steps/second
+      max_position: 10000         # user will configure once hardware range is known
+      home_position: 0            # bottom position (start point)
       invert_direction: false
 
-    axis_b:
+    axis_b:                       # Tinkerforge Silent Stepper Bricklet 2.0
       type: tinkerforge
-      uid: "CHANGE_ME"          # Bricklet UID — find via Brick Viewer
-      host: "localhost"         # Brick Daemon host (localhost if USB)
-      port: 4223                # Brick Daemon port
+      uid: "CHANGE_ME"           # Bricklet UID — find via Brick Viewer
+      host: "localhost"           # Brick Daemon host (localhost if USB)
+      port: 4223                  # Brick Daemon port
       min_position: 1500
       max_position: 9500
-      max_velocity: 2000        # steps/second
-      acceleration: 1000        # steps/second²
-      deceleration: 1000        # steps/second²
-      step_resolution: 8        # microstepping (1,2,4,8,16,32,64,128,256)
+      max_velocity: 2000          # steps/second
+      acceleration: 1000          # steps/second²
+      deceleration: 1000          # steps/second²
+      step_resolution: 8          # microstepping (1,2,4,8,16,32,64,128,256)
 
   cam2:
-    axis_a:
+    axis_a:                       # GPIO linear motor — single pin control
       type: gpio
-      step_pin: 15              # NOTE: if both GPIO motors use the same pins,
-      dir_pin: 17               # they move together. Change if separate pins.
+      step_pin: 17                # GPIO 17 — separate pin from cam1
       steps_per_unit: 200
       max_speed: 1000
       max_position: 10000
       home_position: 0
       invert_direction: false
 
-    axis_b:
+    axis_b:                       # Tinkerforge Silent Stepper Bricklet 2.0
       type: tinkerforge
-      uid: "CHANGE_ME"          # Second bricklet UID
+      uid: "CHANGE_ME"           # Second bricklet UID
       host: "localhost"
       port: 4223
       min_position: 1500
