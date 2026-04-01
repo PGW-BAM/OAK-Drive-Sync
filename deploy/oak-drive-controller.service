@@ -1,7 +1,11 @@
 # Systemd service for the Pi drive controller
-# Install: sudo cp deploy/oak-drive-controller.service /etc/systemd/system/
-#          sudo systemctl daemon-reload
-#          sudo systemctl enable --now oak-drive-controller
+# NOTE: The install.sh script generates this file with correct paths.
+#       This is a reference template only — do not install directly.
+#
+# Manual install (adjust paths for your user):
+#   sudo cp deploy/oak-drive-controller.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now oak-drive-controller
 
 [Unit]
 Description=OAK-Drive-Sync Pi Drive Controller
@@ -13,8 +17,8 @@ Requires=mosquitto.service
 Type=exec
 User=pi
 Group=pi
-WorkingDirectory=/home/pi/oak-drive-sync
-ExecStart=/home/pi/.local/bin/uv run oak-pi run --config config/drive_pinmap.yaml
+WorkingDirectory=/home/pi/OAK-Drive-Sync
+ExecStart=/home/pi/.local/bin/uv run oak-pi run --config config/drive_config.yaml
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -25,10 +29,7 @@ SupplementaryGroups=gpio
 
 # Environment
 Environment=PYTHONUNBUFFERED=1
-
-# Watchdog: systemd will restart if no heartbeat within 30s
-WatchdogSec=30
-NotifyAccess=all
+Environment=PATH=/home/pi/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=multi-user.target
