@@ -322,21 +322,18 @@ def _read_uptime() -> int:
 # Main entry point
 # ──────────────────────────────────────────────
 
-async def run_controller(
-    config_path: str,
-    broker_host: str | None,
-    broker_port: int | None,
-    gui: bool = True,
-) -> None:
-    """Main async entry point."""
+def _load_config(config_path: str, broker_host: str | None, broker_port: int | None) -> tuple[dict, str, int]:
+    """Load config and resolve broker settings."""
     with open(config_path) as f:
         config = yaml.safe_load(f)
-
-    # Override broker settings from CLI if provided
     broker = config.get("broker", {})
     host = broker_host or broker.get("host", "localhost")
     port = broker_port or broker.get("port", 1883)
+    return config, host, port
 
+
+async def _setup_controller(config: dict, host: str, port: int) -> tuple[DriveManager, MQTTClient]:
+    """Create and wire up drives + MQTT. Returns (drive_mgr, mqtt)."""
     mqtt = MQTTClient(
         broker_host=host,
         broker_port=port,
@@ -348,7 +345,65 @@ async def run_controller(
     drive_mgr = DriveManager(config, mqtt)
     await drive_mgr.setup_all()
 
-    # Register MQTT command handlers
+    async def dispatch_command(topic_str: str, payload: dict) -> None:
+        if topic_str.endswith("/move"):
+            await drive_mgr.handle_move(topic_str, payload)
+        elif topic_str.endswith("/home"):
+            await drive_mgr.handle_home(topic_str, payload)
+        elif topic_str.endswith("/stop"):
+            await drive_mgr.handle_stop(topic_str, payload)
+
+    mqtt.subscribe(SUB_ALL_DRIVE_CMDS, dispatch_command)
+    return drive_mgr, mqtt
+
+
+async def run_controller_headless(
+    config_path: str,
+    broker_host: str | None,
+    broker_port: int | None,
+) -> None:
+    """Run without GUI — MQTT + heartbeat only."""
+    config, host, port = _load_config(config_path, broker_host, broker_port)
+    drive_mgr, mqtt = await _setup_controller(config, host, port)
+
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(mqtt.run())
+            tg.create_task(heartbeat_loop(mqtt, drive_mgr))
+    finally:
+        await drive_mgr.cleanup_all()
+
+
+def run_controller_with_gui(
+    config_path: str,
+    broker_host: str | None,
+    broker_port: int | None,
+) -> None:
+    """Run with NiceGUI. NiceGUI owns the event loop; MQTT runs as background tasks."""
+    from nicegui import app as nicegui_app
+    from src.pi_controller.gui import setup_gui, run_gui
+
+    config, host, port = _load_config(config_path, broker_host, broker_port)
+
+    # NiceGUI needs pages registered before ui.run(), but drives need async setup.
+    # We create drive_mgr synchronously (no GPIO init yet), register pages,
+    # then do async setup in on_startup.
+
+    mqtt = MQTTClient(
+        broker_host=host,
+        broker_port=port,
+        client_id="oak-pi-drive-controller",
+        lwt_topic=HEALTH_PI,
+        lwt_payload={"online": False},
+    )
+
+    # Pre-create DriveManager (drives not yet initialized)
+    drive_mgr = DriveManager(config, mqtt)
+
+    # Register all GUI pages
+    gui_cfg = setup_gui(drive_mgr, config, config.get("gui", {}))
+
+    # Wire up MQTT command dispatch
     async def dispatch_command(topic_str: str, payload: dict) -> None:
         if topic_str.endswith("/move"):
             await drive_mgr.handle_move(topic_str, payload)
@@ -359,19 +414,23 @@ async def run_controller(
 
     mqtt.subscribe(SUB_ALL_DRIVE_CMDS, dispatch_command)
 
-    try:
-        tasks: list[asyncio.Task] = []
-        async with asyncio.TaskGroup() as tg:
-            tasks.append(tg.create_task(mqtt.run()))
-            tasks.append(tg.create_task(heartbeat_loop(mqtt, drive_mgr)))
+    # Async startup: init GPIO/Tinkerforge, start MQTT + heartbeat
+    async def on_startup() -> None:
+        await drive_mgr.setup_all()
+        asyncio.create_task(mqtt.run())
+        asyncio.create_task(heartbeat_loop(mqtt, drive_mgr))
+        logger.info("background_tasks.started")
 
-            if gui:
-                # Import GUI here to avoid loading NiceGUI when not needed
-                from src.pi_controller.gui import start_gui
-                gui_cfg = config.get("gui", {})
-                tg.create_task(start_gui(drive_mgr, config, gui_cfg))
-    finally:
+    async def on_shutdown() -> None:
+        await mqtt.stop()
         await drive_mgr.cleanup_all()
+        logger.info("background_tasks.stopped")
+
+    nicegui_app.on_startup(on_startup)
+    nicegui_app.on_shutdown(on_shutdown)
+
+    # This blocks — NiceGUI owns the event loop
+    run_gui(gui_cfg)
 
 
 # ──────────────────────────────────────────────
@@ -396,7 +455,10 @@ def cli() -> None:
 def run(config: str, broker_host: str | None, broker_port: int | None, no_gui: bool) -> None:
     """Start the drive controller."""
     logger.info("pi_controller.starting", config=config)
-    asyncio.run(run_controller(config, broker_host, broker_port, gui=not no_gui))
+    if no_gui:
+        asyncio.run(run_controller_headless(config, broker_host, broker_port))
+    else:
+        run_controller_with_gui(config, broker_host, broker_port)
 
 
 if __name__ == "__main__":

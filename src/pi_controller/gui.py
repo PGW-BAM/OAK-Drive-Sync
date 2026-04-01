@@ -79,8 +79,11 @@ def apply_calibration(drive_mgr: DriveManager) -> None:
 # GUI Application
 # ──────────────────────────────────────────────
 
-async def start_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> None:
-    """Start the NiceGUI web server."""
+def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
+    """Register all NiceGUI pages. Call before ui.run().
+
+    Returns gui_cfg for use by run_gui().
+    """
 
     positions: list[PositionPreset] = load_positions()
     sequence_task: asyncio.Task | None = None
@@ -688,7 +691,14 @@ async def start_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> Non
     host = gui_cfg.get("host", "0.0.0.0")
     port = gui_cfg.get("port", 8080)
 
-    logger.info("gui.starting", host=host, port=port)
+    logger.info("gui.setup_complete", host=host, port=port)
+    return gui_cfg
+
+
+def run_gui(gui_cfg: dict) -> None:
+    """Start the NiceGUI server. This blocks and owns the event loop."""
+    host = gui_cfg.get("host", "0.0.0.0")
+    port = gui_cfg.get("port", 8080)
     ui.run(
         host=host,
         port=port,
