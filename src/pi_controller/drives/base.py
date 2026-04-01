@@ -30,6 +30,7 @@ class BaseDrive(ABC):
         self._current_position: float = 0.0
         self._target_position: float | None = None
         self._move_lock = asyncio.Lock()
+        self.calibration_mode: bool = False
 
     @property
     def key(self) -> str:
@@ -86,3 +87,15 @@ class BaseDrive(ABC):
     @abstractmethod
     def get_max_position(self) -> float:
         """Return the maximum allowed position."""
+
+    @abstractmethod
+    def set_min_position(self, value: float) -> None:
+        """Update the minimum allowed position (calibration)."""
+
+    @abstractmethod
+    def set_max_position(self, value: float) -> None:
+        """Update the maximum allowed position (calibration)."""
+
+    def set_zero(self) -> None:
+        """Reset current position to 0 (define current physical location as zero)."""
+        self._current_position = 0.0

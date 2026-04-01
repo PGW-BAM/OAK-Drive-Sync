@@ -94,7 +94,8 @@ class GPIODrive(BaseDrive):
 
     async def move_to(self, position: float, speed: float = 1.0) -> None:
         async with self._move_lock:
-            position = max(self._home_position, min(self._max_position, position))
+            if not self.calibration_mode:
+                position = max(self._home_position, min(self._max_position, position))
 
             self._target_position = position
             self._state = DriveState.MOVING
@@ -207,3 +208,9 @@ class GPIODrive(BaseDrive):
 
     def get_max_position(self) -> float:
         return self._max_position
+
+    def set_min_position(self, value: float) -> None:
+        self._home_position = value
+
+    def set_max_position(self, value: float) -> None:
+        self._max_position = value
