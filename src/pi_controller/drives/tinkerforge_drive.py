@@ -42,6 +42,7 @@ class TinkerforgeDrive(BaseDrive):
         acceleration: int = 1000,
         deceleration: int = 1000,
         step_resolution: int = 8,  # microstepping: 1,2,4,8,16,32,64,128,256
+        motor_current: int = 1200,  # mA — adjust per motor
     ) -> None:
         super().__init__(cam_id, axis)
         self.uid = uid
@@ -53,6 +54,7 @@ class TinkerforgeDrive(BaseDrive):
         self.acceleration = acceleration
         self.deceleration = deceleration
         self.step_resolution = step_resolution
+        self.motor_current = motor_current
 
         self._ipcon: IPConnection | None = None
         self._stepper: BrickletSilentStepperV2 | None = None
@@ -77,12 +79,19 @@ class TinkerforgeDrive(BaseDrive):
         )
 
         # Configure stepper
-        self._stepper.set_motor_current(800)  # mA — adjust per motor
+        self._stepper.set_motor_current(self.motor_current)
         self._stepper.set_step_configuration(
             self.step_resolution, True  # interpolation
         )
         self._stepper.set_max_velocity(self.max_velocity)
         self._stepper.set_speed_ramping(self.acceleration, self.deceleration)
+
+        # Sync bricklet's internal position counter with our starting position.
+        # On power-up the bricklet starts at 0, which doesn't match our
+        # min_position. Without this, set_target_position() calculates the
+        # wrong number of steps.
+        self._stepper.set_current_position(self._min_position)
+
         self._stepper.set_enabled(True)
 
         # Register position reached callback
@@ -91,12 +100,18 @@ class TinkerforgeDrive(BaseDrive):
             self._on_position_reached,
         )
 
+        # Read actual position from bricklet
+        actual_pos = self._stepper.get_current_position()
+        self._current_position = float(actual_pos)
+
         logger.info(
             "tinkerforge_drive.setup",
             key=self.key,
             uid=self.uid,
             host=self.host,
             port=self.port,
+            current_position=actual_pos,
+            motor_current_mA=self.motor_current,
         )
 
     def _on_position_reached(self, position: int) -> None:
