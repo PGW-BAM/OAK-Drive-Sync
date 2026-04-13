@@ -3,13 +3,15 @@
 Controls a linear motor via a single GPIO pin on the Raspberry Pi 5.
 Supports single-pin mode (step_pin only, no dir_pin) for simple linear actuators,
 or step+dir mode for stepper drivers.
-Uses lgpio hardware-timed PWM for reliable step pulse generation.
+Uses a blocking time.sleep() pulse loop in a thread — the same proven approach
+that works with the motors directly.
 No limit switches for now — position tracked in software, starts at 0 (bottom).
 """
 
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 import structlog
@@ -25,11 +27,15 @@ except ImportError:
     logger.warning("lgpio not available — GPIO drive will run in simulation mode")
 
 
-class GPIODrive(BaseDrive):
-    """Stepper motor controlled via GPIO step/dir pins.
+# Pulse half-period: 10µs high + 10µs low = 20µs per step = 50kHz
+DEFAULT_PULSE_DELAY = 0.00001
 
-    Uses lgpio.tx_pwm() for hardware-timed step pulses instead of
-    asyncio.sleep(), which is too imprecise for stepper motor timing.
+
+class GPIODrive(BaseDrive):
+    """Stepper motor controlled via GPIO pin.
+
+    Generates step pulses using a blocking for-loop with time.sleep()
+    running in a separate thread, matching the proven working approach.
     """
 
     def __init__(
@@ -45,6 +51,7 @@ class GPIODrive(BaseDrive):
         max_position: float = 10000.0,
         home_position: float = 0.0,
         invert_direction: bool = False,
+        pulse_delay: float = DEFAULT_PULSE_DELAY,
     ) -> None:
         super().__init__(cam_id, axis)
         self.step_pin = step_pin
@@ -55,11 +62,12 @@ class GPIODrive(BaseDrive):
         self._max_position = max_position
         self._home_position = home_position
         self.invert_direction = invert_direction
+        self.pulse_delay = pulse_delay
 
         self._gpio_handle: int | None = None
-        self._stop_event = asyncio.Event()
+        self._stop_flag = threading.Event()
+        self._async_stop = asyncio.Event()
         self._simulated = lgpio is None
-        self._moving = False
 
     async def setup(self) -> None:
         if self._simulated:
@@ -80,13 +88,13 @@ class GPIODrive(BaseDrive):
             key=self.key,
             step_pin=self.step_pin,
             dir_pin=self.dir_pin,
+            pulse_delay=self.pulse_delay,
         )
 
     async def cleanup(self) -> None:
         self.emergency_stop()
         if self._gpio_handle is not None:
-            # Stop any running PWM
-            lgpio.tx_pwm(self._gpio_handle, self.step_pin, 0, 0)
+            lgpio.gpio_write(self._gpio_handle, self.step_pin, 0)
             if self.enable_pin is not None:
                 lgpio.gpio_write(self._gpio_handle, self.enable_pin, 1)
             lgpio.gpiochip_close(self._gpio_handle)
@@ -101,6 +109,34 @@ class GPIODrive(BaseDrive):
         if self._gpio_handle and self.enable_pin is not None:
             lgpio.gpio_write(self._gpio_handle, self.enable_pin, 1)
 
+    def _step_loop(self, steps: int, direction: int, delta: float) -> int:
+        """Blocking step pulse loop — runs in a thread.
+
+        This is the same pattern as the proven working script:
+        for loop with lgpio.gpio_write HIGH, time.sleep, LOW, time.sleep.
+
+        Returns the number of steps actually completed.
+        """
+        h = self._gpio_handle
+        pin = self.step_pin
+        delay = self.pulse_delay
+        position_per_step = delta / steps
+        start_pos = self._current_position
+
+        for i in range(steps):
+            if self._stop_flag.is_set():
+                return i
+
+            lgpio.gpio_write(h, pin, 1)
+            time.sleep(delay)
+            lgpio.gpio_write(h, pin, 0)
+            time.sleep(delay)
+
+            # Update position after each step
+            self._current_position = start_pos + (i + 1) * position_per_step
+
+        return steps
+
     async def move_to(self, position: float, speed: float = 1.0) -> None:
         async with self._move_lock:
             if not self.calibration_mode:
@@ -108,39 +144,34 @@ class GPIODrive(BaseDrive):
 
             self._target_position = position
             self._state = DriveState.MOVING
-            self._stop_event.clear()
-            self._moving = True
+            self._stop_flag.clear()
+            self._async_stop.clear()
 
             delta = position - self._current_position
             if abs(delta) < 1e-6:
                 self._state = DriveState.REACHED
-                self._moving = False
                 return
 
             steps = int(abs(delta) * self.steps_per_unit)
             if steps == 0:
                 self._current_position = position
                 self._state = DriveState.REACHED
-                self._moving = False
                 return
 
             direction = 1 if delta > 0 else -1
             if self.invert_direction:
                 direction = -direction
 
-            speed = max(0.01, min(1.0, speed))
-            step_freq = self.max_speed * speed  # Hz
-
             logger.info(
                 "gpio_drive.move_start",
                 key=self.key,
                 target=position,
                 steps=steps,
-                freq_hz=step_freq,
+                pulse_delay=self.pulse_delay,
             )
 
             if self._simulated:
-                await self._simulate_move(position, steps, step_freq)
+                await self._simulate_move(position, steps)
                 return
 
             self._enable()
@@ -151,69 +182,45 @@ class GPIODrive(BaseDrive):
                 lgpio.gpio_write(self._gpio_handle, self.dir_pin, dir_val)
 
             try:
-                # Use hardware-timed PWM for reliable step pulses.
-                # lgpio.tx_pwm generates a 50% duty cycle square wave at the
-                # requested frequency — much more precise than asyncio.sleep.
-                lgpio.tx_pwm(self._gpio_handle, self.step_pin, step_freq, 50)
+                # Run the blocking step loop in a thread so we don't
+                # block the async event loop (GUI, MQTT, heartbeat).
+                loop = asyncio.get_event_loop()
+                steps_done = await loop.run_in_executor(
+                    None, self._step_loop, steps, direction, delta
+                )
 
-                # Calculate expected move duration and wait
-                expected_duration = steps / step_freq
-                start_time = time.monotonic()
-                position_per_step = delta / steps
-
-                # Poll progress while PWM runs
-                while True:
-                    if self._stop_event.is_set():
-                        lgpio.tx_pwm(self._gpio_handle, self.step_pin, 0, 0)
-                        logger.warning("gpio_drive.stopped_mid_move", key=self.key)
-                        self._state = DriveState.IDLE
-                        self._moving = False
-                        return
-
-                    elapsed = time.monotonic() - start_time
-                    if elapsed >= expected_duration:
-                        break
-
-                    # Update position estimate based on elapsed time
-                    progress = min(elapsed / expected_duration, 1.0)
-                    steps_done = int(progress * steps)
-                    self._current_position = (
-                        self._current_position
-                        if steps_done == 0
-                        else (position - delta) + steps_done * position_per_step
+                if self._stop_flag.is_set():
+                    logger.warning(
+                        "gpio_drive.stopped_mid_move",
+                        key=self.key,
+                        steps_done=steps_done,
+                        steps_total=steps,
                     )
+                    self._state = DriveState.IDLE
+                    return
 
-                    await asyncio.sleep(0.05)  # 50ms poll interval
-
-                # Stop PWM
-                lgpio.tx_pwm(self._gpio_handle, self.step_pin, 0, 0)
-
-                # Snap to target
+                # Snap to target to avoid float drift
                 self._current_position = position
                 self._state = DriveState.REACHED
-                self._moving = False
                 logger.info("gpio_drive.move_complete", key=self.key, position=position)
 
             except Exception as exc:
-                lgpio.tx_pwm(self._gpio_handle, self.step_pin, 0, 0)
                 self._state = DriveState.FAULT
-                self._moving = False
                 self._disable()
                 logger.error("gpio_drive.move_error", key=self.key, error=str(exc))
                 raise
 
-    async def _simulate_move(self, target: float, steps: int, step_freq: float) -> None:
+    async def _simulate_move(self, target: float, steps: int) -> None:
         """Simulated movement for development without GPIO hardware."""
-        total_time = steps / step_freq
+        total_time = steps * self.pulse_delay * 2
         sim_time = min(total_time, 3.0)
         elapsed = 0.0
         start_pos = self._current_position
         delta = target - start_pos
 
         while elapsed < sim_time:
-            if self._stop_event.is_set():
+            if self._async_stop.is_set():
                 self._state = DriveState.IDLE
-                self._moving = False
                 return
             await asyncio.sleep(0.05)
             elapsed += 0.05
@@ -222,7 +229,6 @@ class GPIODrive(BaseDrive):
 
         self._current_position = target
         self._state = DriveState.REACHED
-        self._moving = False
         logger.info("gpio_drive.simulated_move_complete", key=self.key, position=target)
 
     async def home(self) -> None:
@@ -239,13 +245,13 @@ class GPIODrive(BaseDrive):
         logger.info("gpio_drive.homed", key=self.key)
 
     def emergency_stop(self) -> None:
-        self._stop_event.set()
+        self._stop_flag.set()
+        self._async_stop.set()
         if self._gpio_handle is not None and lgpio is not None:
-            lgpio.tx_pwm(self._gpio_handle, self.step_pin, 0, 0)
+            lgpio.gpio_write(self._gpio_handle, self.step_pin, 0)
         self._disable()
         self._target_position = None
         self._state = DriveState.IDLE
-        self._moving = False
         logger.warning("gpio_drive.emergency_stop", key=self.key)
 
     def get_min_position(self) -> float:

@@ -20,6 +20,7 @@ drives:
       max_position: 10000         # user will configure once hardware range is known
       home_position: 0            # bottom position (start point)
       invert_direction: false
+      pulse_delay: 0.00001        # seconds per half-pulse (0.00001 = 10µs → 20µs/step → 50kHz)
 
     axis_b:                       # Tinkerforge Silent Stepper Bricklet 2.0
       type: tinkerforge
@@ -43,6 +44,7 @@ drives:
       max_position: 10000
       home_position: 0
       invert_direction: false
+      pulse_delay: 0.00001        # seconds per half-pulse
 
     axis_b:                       # Tinkerforge Silent Stepper Bricklet 2.0
       type: tinkerforge
