@@ -23,7 +23,7 @@ drives:
 
     axis_b:                       # Tinkerforge Silent Stepper Bricklet 2.0
       type: tinkerforge
-      uid: "CHANGE_ME"           # Bricklet UID — find via Brick Viewer
+      uid: "2eoB"                 # Bricklet UID (found via Brick Viewer)
       host: "localhost"           # Brick Daemon host (localhost if USB)
       port: 4223                  # Brick Daemon port
       min_position: 1500
@@ -45,7 +45,7 @@ drives:
 
     axis_b:                       # Tinkerforge Silent Stepper Bricklet 2.0
       type: tinkerforge
-      uid: "CHANGE_ME"           # Second bricklet UID
+      uid: "2eoz"                 # Second bricklet UID
       host: "localhost"
       port: 4223
       min_position: 1500

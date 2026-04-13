@@ -81,12 +81,26 @@ class DriveManager:
         logger.info("drives.initialized", count=len(self.drives), keys=list(self.drives.keys()))
 
     async def setup_all(self) -> None:
-        for drive in self.drives.values():
-            await drive.setup()
+        failed = []
+        for drive in list(self.drives.values()):
+            try:
+                await drive.setup()
+            except Exception as exc:
+                logger.error(
+                    "drive.setup_failed",
+                    key=drive.key,
+                    error=str(exc),
+                )
+                failed.append(drive.key)
+        if failed:
+            logger.warning("drives.some_failed", failed=failed, msg="These drives will be unavailable")
 
     async def cleanup_all(self) -> None:
         for drive in self.drives.values():
-            await drive.cleanup()
+            try:
+                await drive.cleanup()
+            except Exception as exc:
+                logger.error("drive.cleanup_failed", key=drive.key, error=str(exc))
 
     async def handle_move(self, topic_str: str, payload: dict) -> None:
         parts = topic_str.split("/")
