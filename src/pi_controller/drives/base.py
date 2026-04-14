@@ -115,3 +115,8 @@ class BaseDrive(ABC):
     def is_simulated(self) -> bool:
         """True if the drive is running in software simulation (no real hardware)."""
         return False
+
+    @property
+    def setup_error(self) -> str | None:
+        """Human-readable reason why setup failed, or None."""
+        return None
