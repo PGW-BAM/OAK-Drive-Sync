@@ -5,9 +5,9 @@
 positions:
   - name: "Home"
     cam1_a: 0
-    cam1_b: 1500
+    cam1_b: 0
     cam2_a: 0
-    cam2_b: 1500
+    cam2_b: 0
 
   - name: "Center"
     cam1_a: 5000

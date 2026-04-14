@@ -1,11 +1,14 @@
-"""GPIO stepper drive controller using lgpio.
+"""GPIO stepper drive controller using gpiozero.
 
-Controls a linear motor via a single GPIO pin on the Raspberry Pi 5.
-Supports single-pin mode (step_pin only, no dir_pin) for simple linear actuators,
-or step+dir mode for stepper drivers.
-Uses a blocking time.sleep() pulse loop in a thread — the same proven approach
-that works with the motors directly.
-No limit switches for now — position tracked in software, starts at 0 (bottom).
+Controls a linear motor via PUL (pulse) + DIR (direction) GPIO pins on the
+Raspberry Pi 5, matching the proven working script from the project reference.
+
+Pin assignments (from drive_config.yaml):
+  cam1:a  — PUL=GPIO 14, DIR=GPIO 15
+  cam2:a  — PUL=GPIO 16, DIR=GPIO 17
+
+Uses a blocking time.sleep() pulse loop in a thread — the same approach as the
+reference script that physically moves the motors.
 """
 
 from __future__ import annotations
@@ -21,21 +24,24 @@ from src.pi_controller.drives.base import BaseDrive, DriveState
 logger = structlog.get_logger()
 
 try:
-    import lgpio
+    from gpiozero import LED
+    from gpiozero.exc import GPIOZeroError
 except ImportError:
-    lgpio = None  # type: ignore[assignment]
-    logger.warning("lgpio not available — GPIO drive will run in simulation mode")
+    LED = None  # type: ignore[assignment,misc]
+    GPIOZeroError = Exception  # type: ignore[assignment,misc]
+    logger.warning("gpiozero not available — GPIO drive will run in simulation mode")
 
 
-# Pulse half-period: 10µs high + 10µs low = 20µs per step = 50kHz
+# Pulse half-period matching the proven working reference script:
+# 10µs high + 10µs low = 20µs per step
 DEFAULT_PULSE_DELAY = 0.00001
 
 
 class GPIODrive(BaseDrive):
-    """Stepper motor controlled via GPIO pin.
+    """Linear motor controlled via PUL + DIR GPIO pins.
 
     Generates step pulses using a blocking for-loop with time.sleep()
-    running in a separate thread, matching the proven working approach.
+    running in a separate thread, identical to the working reference script.
     """
 
     def __init__(
@@ -44,8 +50,7 @@ class GPIODrive(BaseDrive):
         axis: str,
         *,
         step_pin: int,
-        dir_pin: int | None = None,
-        enable_pin: int | None = None,
+        dir_pin: int,
         steps_per_unit: float = 200.0,
         max_speed: float = 1000.0,
         max_position: float = 100000.0,
@@ -56,7 +61,6 @@ class GPIODrive(BaseDrive):
         super().__init__(cam_id, axis)
         self.step_pin = step_pin
         self.dir_pin = dir_pin
-        self.enable_pin = enable_pin
         self.steps_per_unit = steps_per_unit
         self.max_speed = max_speed
         self._max_position = max_position
@@ -64,24 +68,24 @@ class GPIODrive(BaseDrive):
         self.invert_direction = invert_direction
         self.pulse_delay = pulse_delay
 
-        self._gpio_handle: int | None = None
+        self._pul: LED | None = None
+        self._dir: LED | None = None
         self._stop_flag = threading.Event()
         self._async_stop = asyncio.Event()
-        self._simulated = lgpio is None
+        self._simulated = LED is None
 
     async def setup(self) -> None:
         if self._simulated:
             logger.info("gpio_drive.setup_simulated", key=self.key)
             return
 
-        h = lgpio.gpiochip_open(0)
-        self._gpio_handle = h
-
-        lgpio.gpio_claim_output(h, self.step_pin, 0)
-        if self.dir_pin is not None:
-            lgpio.gpio_claim_output(h, self.dir_pin, 0)
-        if self.enable_pin is not None:
-            lgpio.gpio_claim_output(h, self.enable_pin, 1)  # disabled by default
+        try:
+            self._pul = LED(self.step_pin)
+            self._dir = LED(self.dir_pin)
+        except GPIOZeroError as exc:
+            logger.error("gpio_drive.setup_failed", key=self.key, error=str(exc))
+            self._simulated = True
+            return
 
         logger.info(
             "gpio_drive.setup",
@@ -93,46 +97,49 @@ class GPIODrive(BaseDrive):
 
     async def cleanup(self) -> None:
         self.emergency_stop()
-        if self._gpio_handle is not None:
-            lgpio.gpio_write(self._gpio_handle, self.step_pin, 0)
-            if self.enable_pin is not None:
-                lgpio.gpio_write(self._gpio_handle, self.enable_pin, 1)
-            lgpio.gpiochip_close(self._gpio_handle)
-            self._gpio_handle = None
+        if self._pul is not None:
+            self._pul.off()
+            self._pul.close()
+            self._pul = None
+        if self._dir is not None:
+            self._dir.off()
+            self._dir.close()
+            self._dir = None
         logger.info("gpio_drive.cleanup", key=self.key)
-
-    def _enable(self) -> None:
-        if self._gpio_handle and self.enable_pin is not None:
-            lgpio.gpio_write(self._gpio_handle, self.enable_pin, 0)
-
-    def _disable(self) -> None:
-        if self._gpio_handle and self.enable_pin is not None:
-            lgpio.gpio_write(self._gpio_handle, self.enable_pin, 1)
 
     def _step_loop(self, steps: int, direction: int, delta: float) -> int:
         """Blocking step pulse loop — runs in a thread.
 
-        This is the same pattern as the proven working script:
-        for loop with lgpio.gpio_write HIGH, time.sleep, LOW, time.sleep.
+        Identical pattern to the proven working reference script:
+          dir.on/off → for loop: pul.on, sleep, pul.off, sleep
 
         Returns the number of steps actually completed.
         """
-        h = self._gpio_handle
-        pin = self.step_pin
+        pul = self._pul
+        dir_dev = self._dir
         delay = self.pulse_delay
         position_per_step = delta / steps
         start_pos = self._current_position
+
+        # Set direction before pulsing
+        forward = direction > 0
+        if self.invert_direction:
+            forward = not forward
+        if dir_dev is not None:
+            if forward:
+                dir_dev.on()
+            else:
+                dir_dev.off()
 
         for i in range(steps):
             if self._stop_flag.is_set():
                 return i
 
-            lgpio.gpio_write(h, pin, 1)
+            pul.on()
             time.sleep(delay)
-            lgpio.gpio_write(h, pin, 0)
+            pul.off()
             time.sleep(delay)
 
-            # Update position after each step
             self._current_position = start_pos + (i + 1) * position_per_step
 
         return steps
@@ -159,14 +166,13 @@ class GPIODrive(BaseDrive):
                 return
 
             direction = 1 if delta > 0 else -1
-            if self.invert_direction:
-                direction = -direction
 
             logger.info(
                 "gpio_drive.move_start",
                 key=self.key,
                 target=position,
                 steps=steps,
+                direction=direction,
                 pulse_delay=self.pulse_delay,
             )
 
@@ -174,16 +180,7 @@ class GPIODrive(BaseDrive):
                 await self._simulate_move(position, steps)
                 return
 
-            self._enable()
-
-            # Set direction (only if dir_pin is configured)
-            if self.dir_pin is not None:
-                dir_val = 1 if direction > 0 else 0
-                lgpio.gpio_write(self._gpio_handle, self.dir_pin, dir_val)
-
             try:
-                # Run the blocking step loop in a thread so we don't
-                # block the async event loop (GUI, MQTT, heartbeat).
                 loop = asyncio.get_event_loop()
                 steps_done = await loop.run_in_executor(
                     None, self._step_loop, steps, direction, delta
@@ -199,14 +196,12 @@ class GPIODrive(BaseDrive):
                     self._state = DriveState.IDLE
                     return
 
-                # Snap to target to avoid float drift
                 self._current_position = position
                 self._state = DriveState.REACHED
                 logger.info("gpio_drive.move_complete", key=self.key, position=position)
 
             except Exception as exc:
                 self._state = DriveState.FAULT
-                self._disable()
                 logger.error("gpio_drive.move_error", key=self.key, error=str(exc))
                 raise
 
@@ -232,12 +227,11 @@ class GPIODrive(BaseDrive):
         logger.info("gpio_drive.simulated_move_complete", key=self.key, position=target)
 
     async def home(self) -> None:
-        """Home to position 0 (bottom). No limit switches — software only."""
+        """Home to position 0. No limit switches — software only."""
         self._state = DriveState.HOMING
         logger.info("gpio_drive.homing", key=self.key)
 
         if self._current_position != self._home_position:
-            self._state = DriveState.HOMING
             await self.move_to(self._home_position, speed=0.3)
 
         self._current_position = self._home_position
@@ -247,9 +241,8 @@ class GPIODrive(BaseDrive):
     def emergency_stop(self) -> None:
         self._stop_flag.set()
         self._async_stop.set()
-        if self._gpio_handle is not None and lgpio is not None:
-            lgpio.gpio_write(self._gpio_handle, self.step_pin, 0)
-        self._disable()
+        if self._pul is not None:
+            self._pul.off()
         self._target_position = None
         self._state = DriveState.IDLE
         logger.warning("gpio_drive.emergency_stop", key=self.key)

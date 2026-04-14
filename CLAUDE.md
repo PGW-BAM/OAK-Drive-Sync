@@ -22,22 +22,22 @@ Synchronized control system for **2× Luxonis OAK-D 4 Pro** cameras with **4× m
 
 ### Drive Hardware
 
-| Drive   | Type          | Control Method                          | Pin/UID |
-|---------|---------------|-----------------------------------------|---------|
-| cam1:a  | GPIO linear   | Blocking step pulse loop via lgpio      | GPIO 15 |
-| cam1:b  | Tinkerforge   | Silent Stepper Bricklet 2.0 via brickd  | UID 2eoB |
-| cam2:a  | GPIO linear   | Blocking step pulse loop via lgpio      | GPIO 17 |
-| cam2:b  | Tinkerforge   | Silent Stepper Bricklet 2.0 via brickd  | UID 2eoz |
+| Drive   | Type          | Control Method                          | PUL pin | DIR pin |
+|---------|---------------|-----------------------------------------|---------|---------|
+| cam1:a  | GPIO linear   | gpiozero step pulse loop (PUL + DIR)    | GPIO 14 | GPIO 15 |
+| cam1:b  | Tinkerforge   | Silent Stepper Bricklet 2.0 via brickd  | UID 2eoB | — |
+| cam2:a  | GPIO linear   | gpiozero step pulse loop (PUL + DIR)    | GPIO 16 | GPIO 17 |
+| cam2:b  | Tinkerforge   | Silent Stepper Bricklet 2.0 via brickd  | UID 2eoz | — |
 
-**GPIO motors** use a `time.sleep(0.00001)` pulse loop (10µs HIGH + 10µs LOW) running in a thread. No direction pin — single pin per motor. No limit switches yet — calibration is manual via the GUI.
+**GPIO motors** use a `time.sleep(0.00001)` pulse loop (10µs HIGH + 10µs LOW) running in a thread via **gpiozero** `LED`. Two pins per motor: PUL (pulse) and DIR (direction). No limit switches yet — calibration is manual via the GUI.
 
-**Tinkerforge motors** use `set_target_position()` with position range 1500–9500. Bricklet position counter is synced on startup via `set_current_position()`.
+**Tinkerforge motors** use `set_target_position()`. Bricklet position counter is synced on startup via `set_current_position()`. Position range is determined by manual calibration — no software floor enforced.
 
 ### Communication Stack
 
 - **MQTT 5.0** via Mosquitto broker (runs on Pi)
 - **DepthAI SDK** for OAK-D camera control (Windows side)
-- **lgpio** for GPIO step pulse generation (Pi side)
+- **gpiozero** for GPIO step pulse generation (Pi side)
 - **Tinkerforge Python bindings** for Silent Stepper control (Pi side)
 - **NiceGUI** for Pi web interface (drive control, calibration, sequences)
 - **Email notifications** via SMTP (aiosmtplib)

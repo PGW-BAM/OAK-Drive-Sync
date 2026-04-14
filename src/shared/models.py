@@ -193,9 +193,9 @@ class CaptureSequence(BaseModel):
 class PositionPreset(BaseModel):
     name: str
     cam1_a: float = 0.0
-    cam1_b: float = 1500.0
+    cam1_b: float = 0.0
     cam2_a: float = 0.0
-    cam2_b: float = 1500.0
+    cam2_b: float = 0.0
 
     def as_drive_targets(self) -> dict[str, float]:
         return {

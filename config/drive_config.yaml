@@ -13,13 +13,14 @@ settling_delay_ms: 150
 
 drives:
   cam1:
-    axis_a:                       # GPIO linear motor — single pin control
+    axis_a:                       # GPIO linear motor — PUL + DIR pin control
       type: gpio
-      step_pin: 15                # GPIO 15
+      step_pin: 14                # PUL1 — GPIO 14
+      dir_pin: 15                 # DIR1 — GPIO 15
       steps_per_unit: 200         # steps per unit of position — adjust for your motor/gearing
       max_speed: 1000             # max steps/second
       invert_direction: false
-      pulse_delay: 0.00001        # seconds per half-pulse (0.00001 = 10µs → 20µs/step → 50kHz)
+      pulse_delay: 0.00001        # seconds per half-pulse (0.00001 = 10µs → 20µs/step → ~50kHz)
 
     axis_b:                       # Tinkerforge Silent Stepper Bricklet 2.0
       type: tinkerforge
@@ -33,13 +34,14 @@ drives:
       motor_current: 1200         # mA — increase if motor doesn't move
 
   cam2:
-    axis_a:                       # GPIO linear motor — single pin control
+    axis_a:                       # GPIO linear motor — PUL + DIR pin control
       type: gpio
-      step_pin: 17                # GPIO 17
+      step_pin: 16                # PUL2 — GPIO 16
+      dir_pin: 17                 # DIR2 — GPIO 17
       steps_per_unit: 200
       max_speed: 1000
       invert_direction: false
-      pulse_delay: 0.00001        # seconds per half-pulse
+      pulse_delay: 0.00001        # seconds per half-pulse (0.00001 = 10µs → 20µs/step → ~50kHz)
 
     axis_b:                       # Tinkerforge Silent Stepper Bricklet 2.0
       type: tinkerforge

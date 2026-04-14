@@ -340,9 +340,9 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
             name_input = ui.input(label="Name", placeholder="e.g. Top Left").classes("w-48")
 
             cam1a_input = ui.number(label="cam1:a", value=0, format="%.0f").classes("w-24")
-            cam1b_input = ui.number(label="cam1:b", value=1500, format="%.0f").classes("w-24")
+            cam1b_input = ui.number(label="cam1:b", value=0, format="%.0f").classes("w-24")
             cam2a_input = ui.number(label="cam2:a", value=0, format="%.0f").classes("w-24")
-            cam2b_input = ui.number(label="cam2:b", value=1500, format="%.0f").classes("w-24")
+            cam2b_input = ui.number(label="cam2:b", value=0, format="%.0f").classes("w-24")
 
             def add_position():
                 if not name_input.value:
@@ -351,9 +351,9 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
                 preset = PositionPreset(
                     name=name_input.value,
                     cam1_a=cam1a_input.value or 0,
-                    cam1_b=cam1b_input.value or 1500,
+                    cam1_b=cam1b_input.value or 0,
                     cam2_a=cam2a_input.value or 0,
-                    cam2_b=cam2b_input.value or 1500,
+                    cam2_b=cam2b_input.value or 0,
                 )
                 positions.append(preset)
                 save_positions(positions)
