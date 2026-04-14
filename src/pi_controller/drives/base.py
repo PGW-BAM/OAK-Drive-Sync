@@ -105,3 +105,8 @@ class BaseDrive(ABC):
     def set_zero(self) -> None:
         """Reset current position to 0 (define current physical location as zero)."""
         self._current_position = 0.0
+
+    def seed_position(self, value: float) -> None:
+        """Pre-seed current position from persisted log at startup.
+        Only call before any movement has occurred."""
+        self._current_position = value

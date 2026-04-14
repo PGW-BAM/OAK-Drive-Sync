@@ -209,6 +209,7 @@ class DriveManager:
                 logger.warning("drive.stopped", key=key)
 
     async def _publish_position(self, drive: BaseDrive, sequence_id: str | None = None) -> None:
+        from src.pi_controller.position_log import append_position_entry
         pos = DrivePosition(
             sequence_id=sequence_id,
             drive_axis=drive.axis,
@@ -222,6 +223,7 @@ class DriveManager:
             qos=1,
             retain=True,
         )
+        append_position_entry(self.drives)
 
     def get_drive_states(self) -> dict[str, str]:
         return {k: v.state.value for k, v in self.drives.items()}
@@ -395,8 +397,14 @@ async def run_controller_headless(
     broker_port: int | None,
 ) -> None:
     """Run without GUI — MQTT + heartbeat only."""
+    from src.pi_controller.gui import apply_calibration
+    from src.pi_controller.position_log import rotate_log, seed_positions_from_log
+
+    rotate_log()
     config, host, port = _load_config(config_path, broker_host, broker_port)
     drive_mgr, mqtt = await _setup_controller(config, host, port)
+    seed_positions_from_log(drive_mgr)
+    apply_calibration(drive_mgr)
 
     try:
         async with asyncio.TaskGroup() as tg:
@@ -452,7 +460,13 @@ def run_controller_with_gui(
 
     # Async startup: init GPIO/Tinkerforge, subscribe IMU, start MQTT + heartbeat
     async def on_startup() -> None:
+        from src.pi_controller.gui import apply_calibration
+        from src.pi_controller.position_log import rotate_log, seed_positions_from_log
+
+        rotate_log()
         await drive_mgr.setup_all()
+        seed_positions_from_log(drive_mgr)
+        apply_calibration(drive_mgr)
         mqtt.subscribe(SUB_ALL_IMU_TELEMETRY, drift_detector.on_imu_message)
         asyncio.create_task(mqtt.run())
         asyncio.create_task(heartbeat_loop(mqtt, drive_mgr))

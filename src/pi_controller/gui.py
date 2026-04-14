@@ -11,6 +11,7 @@ Lightweight browser-based GUI for non-programmers to:
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -59,8 +60,9 @@ def load_calibration() -> dict[str, dict[str, float]]:
 
 
 def save_calibration(cal: dict[str, dict[str, float]]) -> None:
-    data = {"drives": cal}
-    CALIBRATION_FILE.write_text(yaml.dump(data, default_flow_style=False))
+    tmp = CALIBRATION_FILE.with_suffix(".yaml.tmp")
+    tmp.write_text(yaml.dump({"drives": cal}, default_flow_style=False))
+    os.replace(tmp, CALIBRATION_FILE)
 
 
 def apply_calibration(drive_mgr: DriveManager) -> None:
@@ -71,9 +73,38 @@ def apply_calibration(drive_mgr: DriveManager) -> None:
         if drive:
             if "min" in limits:
                 drive.set_min_position(limits["min"])
+                drive.min_calibrated = True
             if "max" in limits:
                 drive.set_max_position(limits["max"])
+                drive.max_calibrated = True
             logger.info("calibration.applied", key=key, limits=limits)
+
+
+def _auto_save_calibration(drive_mgr: DriveManager) -> None:
+    """Save calibration.yaml for all currently-calibrated drives (partial saves OK)."""
+    cal = {
+        d.key: {"min": d.get_min_position(), "max": d.get_max_position()}
+        for d in drive_mgr.drives.values()
+        if d.calibrated
+    }
+    if cal:
+        save_calibration(cal)
+        logger.info("calibration.auto_saved", drives=list(cal.keys()))
+
+
+def _finish_verify(session: object, drive_mgr: DriveManager) -> None:  # type: ignore[type-arg]
+    """Called when all drives have been processed in Quick Verify."""
+    recalibrate_keys: list[str] = session.recalibrate_keys  # type: ignore[attr-defined]
+    if recalibrate_keys:
+        ui.notify(
+            f"Drives {recalibrate_keys} need manual recalibration. Going to Calibration page.",
+            type="warning",
+            timeout=5000,
+        )
+        ui.navigate.to("/calibration")
+    else:
+        ui.notify("All drives verified! System ready.", type="positive")
+        ui.navigate.to("/")
 
 
 # ──────────────────────────────────────────────
@@ -125,6 +156,18 @@ def setup_gui(
                 ui.link("Go to Calibration", "/calibration").classes(
                     "ml-4 text-red-800 underline font-bold"
                 )
+
+        # Saved calibration banner (shown only when calibration.yaml exists)
+        if CALIBRATION_FILE.exists():
+            with ui.card().classes("w-full bg-blue-100 border-l-4 border-blue-500"):
+                with ui.row().classes("items-center gap-4"):
+                    ui.icon("verified").classes("text-blue-600 text-2xl")
+                    ui.label("Saved calibration loaded from disk").classes(
+                        "text-blue-800 font-bold"
+                    )
+                    ui.link("Quick Verify →", "/verify-calibration").classes(
+                        "ml-4 text-blue-900 underline font-bold"
+                    )
 
         with ui.card().classes("w-full"):
             ui.label("Drive Status").classes("text-lg font-bold")
@@ -620,6 +663,7 @@ def setup_gui(
                             cl.text = "CALIBRATED"
                             cl.classes(replace="font-bold text-sm w-32 text-green-600")
                         update_overall_status()
+                        _auto_save_calibration(drive_mgr)
                         ui.notify(f"{k} MIN set to {d.current_position:.1f}", type="positive")
 
                     ui.button("Set as Min", on_click=set_min).props("color=deep-orange")
@@ -636,6 +680,7 @@ def setup_gui(
                             cl.text = "CALIBRATED"
                             cl.classes(replace="font-bold text-sm w-32 text-green-600")
                         update_overall_status()
+                        _auto_save_calibration(drive_mgr)
                         ui.notify(f"{k} MAX set to {d.current_position:.1f}", type="positive")
 
                     ui.button("Set as Max", on_click=set_max).props("color=deep-orange")
@@ -657,6 +702,16 @@ def setup_gui(
                     sl.text = f"({d.state.value})"
 
                 ui.timer(0.2, update_cal_labels)
+
+        # ── Save Calibration ─────────────────────
+        with ui.row().classes("gap-4 items-center mt-6"):
+            def save_cal_click():
+                _auto_save_calibration(drive_mgr)
+                ui.notify("Calibration saved to config/calibration.yaml", type="positive")
+            ui.button("Save Calibration", on_click=save_cal_click).props("color=primary size=lg")
+            ui.label("Saves all currently-calibrated drives to disk.").classes(
+                "text-gray-500 text-sm"
+            )
 
         # ── IMU Calibration Section ──────────────
         ui.separator().classes("mt-8")
@@ -843,6 +898,176 @@ def setup_gui(
                         ui.button(
                             "Capture Here", on_click=capture_checkpoint
                         ).props("color=teal")
+
+    # ── Quick Re-verify Page ───────────────────
+
+    @ui.page("/verify-calibration")
+    def verify_calibration_page():
+        ui.page_title("Verify Calibration")
+
+        from src.pi_controller.verify_calibration import (
+            DriveVerifyState,
+            VerifySession,
+            VerifyStep,
+        )
+
+        with ui.header().classes("bg-blue-900 text-white"):
+            ui.label("OAK Drive Controller").classes("text-xl font-bold")
+            ui.space()
+            with ui.row().classes("gap-2"):
+                ui.link("Dashboard", "/").classes("text-white")
+                ui.link("Manual", "/manual").classes("text-white")
+                ui.link("Positions", "/positions").classes("text-white")
+                ui.link("Sequences", "/sequences").classes("text-white")
+                ui.link("Calibration", "/calibration").classes("text-white")
+                ui.link("Settings", "/settings").classes("text-white")
+
+        cal = load_calibration()
+        if not cal:
+            ui.label("No saved calibration found.").classes("text-red-600 font-bold mt-4")
+            ui.link("Go to Calibration", "/calibration").classes("text-blue-700 underline")
+            return
+
+        session = VerifySession(
+            drives=[
+                DriveVerifyState(key=k, saved_min=v["min"], saved_max=v["max"])
+                for k, v in cal.items()
+                if drive_mgr.drives.get(k)
+            ]
+        )
+
+        # ── Intro card ──────────────────────────────
+        intro_card = ui.card().classes("w-full bg-blue-50 border-l-4 border-blue-500 mt-4")
+        with intro_card:
+            ui.label("Saved Calibration Found").classes("text-2xl font-bold text-blue-800")
+            ui.label(
+                "The following limits were loaded from config/calibration.yaml at startup."
+            ).classes("text-gray-600 mt-1")
+            with ui.row().classes("flex-wrap gap-6 mt-3"):
+                for k, v in cal.items():
+                    with ui.card().classes("bg-white p-2"):
+                        ui.label(k).classes("font-bold text-blue-700")
+                        ui.label(f"Min: {v['min']:.0f}  Max: {v['max']:.0f}").classes("font-mono")
+            ui.separator().classes("mt-4")
+            with ui.row().classes("gap-4 mt-3"):
+                async def start_verify():
+                    intro_card.set_visibility(False)
+                    verify_card.set_visibility(True)
+                    await advance_to_next_drive()
+
+                def use_as_is():
+                    ui.notify("Using saved calibration as-is. System ready.", type="positive")
+                    ui.navigate.to("/")
+
+                ui.button("Quick Verify", on_click=start_verify).props("color=primary size=lg")
+                ui.button("Use As-Is", on_click=use_as_is).props("color=teal size=lg")
+                ui.label(
+                    "Quick Verify moves each drive to its saved limits so you can confirm "
+                    "the physical position is still correct."
+                ).classes("text-gray-500 text-sm self-center ml-2")
+
+        # ── Verify card (hidden until Quick Verify clicked) ─────
+        verify_card = ui.card().classes("w-full mt-4").set_visibility(False)
+        with verify_card:
+            progress_label = ui.label("").classes("text-gray-500 text-sm mb-1")
+            drive_label = ui.label("").classes("text-2xl font-bold text-blue-800")
+            step_label = ui.label("").classes("text-orange-700 font-bold text-lg mt-1")
+            pos_label = ui.label("").classes("font-mono text-xl mt-2")
+
+            ui.separator().classes("my-4")
+
+            with ui.row().classes("gap-4"):
+                async def on_confirm():
+                    if session.is_complete:
+                        return
+                    dvs = session.current
+                    if dvs.step == VerifyStep.AWAITING_MIN_CONFIRM:
+                        await do_confirm_min()
+                    elif dvs.step == VerifyStep.AWAITING_MAX_CONFIRM:
+                        do_confirm_max()
+
+                def on_recalibrate():
+                    if session.is_complete:
+                        return
+                    dvs = session.current
+                    session.recalibrate_keys.append(dvs.key)
+                    drive = drive_mgr.drives.get(dvs.key)
+                    if drive:
+                        drive.min_calibrated = False
+                        drive.max_calibrated = False
+                    dvs.step = VerifyStep.NEEDS_RECALIBRATE
+                    session.current_index += 1
+                    asyncio.create_task(advance_to_next_drive())
+
+                confirm_btn = ui.button("Confirm OK", on_click=on_confirm).props(
+                    "color=green size=lg"
+                )
+                recal_btn = ui.button("Recalibrate This Drive", on_click=on_recalibrate).props(  # noqa: F841
+                    "color=orange size=lg"
+                )
+
+        async def advance_to_next_drive():
+            if session.is_complete:
+                _finish_verify(session, drive_mgr)
+                return
+
+            dvs = session.current
+            drive = drive_mgr.drives.get(dvs.key)
+            if not drive:
+                session.current_index += 1
+                await advance_to_next_drive()
+                return
+
+            total = len(session.drives)
+            idx = session.current_index + 1
+            progress_label.text = f"Drive {idx} of {total}"
+            drive_label.text = f"Drive {dvs.key}"
+            step_label.text = f"Moving to MIN ({dvs.saved_min:.0f})…"
+            confirm_btn.props("disabled=true")
+
+            dvs.step = VerifyStep.MOVING_TO_MIN
+            await drive.move_to(dvs.saved_min, speed=0.5)
+            dvs.step = VerifyStep.AWAITING_MIN_CONFIRM
+
+            step_label.text = (
+                f"At MIN ({dvs.saved_min:.0f}) — does this look correct?"
+            )
+            confirm_btn.props(remove="disabled")
+
+        async def do_confirm_min():
+            dvs = session.current
+            drive = drive_mgr.drives.get(dvs.key)
+            if not drive:
+                return
+
+            dvs.step = VerifyStep.MOVING_TO_MAX
+            step_label.text = f"Moving to MAX ({dvs.saved_max:.0f})…"
+            confirm_btn.props("disabled=true")
+
+            await drive.move_to(dvs.saved_max, speed=0.5)
+            dvs.step = VerifyStep.AWAITING_MAX_CONFIRM
+
+            step_label.text = (
+                f"At MAX ({dvs.saved_max:.0f}) — does this look correct?"
+            )
+            confirm_btn.props(remove="disabled")
+
+        def do_confirm_max():
+            dvs = session.current
+            dvs.confirmed = True
+            dvs.step = VerifyStep.DONE
+            session.current_index += 1
+            asyncio.create_task(advance_to_next_drive())
+
+        # Live position ticker
+        def update_pos_label():
+            if not session.is_complete and session.drives:
+                dvs = session.current
+                drive = drive_mgr.drives.get(dvs.key)
+                if drive:
+                    pos_label.text = f"Position: {drive.current_position:.1f}"
+
+        ui.timer(0.2, update_pos_label)
 
     # ── Settings Tab ───────────────────────────
 
