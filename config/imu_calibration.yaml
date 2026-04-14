@@ -1,0 +1,24 @@
+# IMU-based drift detection calibration
+# ─────────────────────────────────────
+# Edit steps_per_degree after running calibration to determine the
+# conversion factor between drive steps and camera angle (degrees).
+#
+# Checkpoints are defined per camera + axis_b (Tinkerforge radial drives only).
+# Up to 4 checkpoints per drive. Each checkpoint records:
+#   - name:               unique label shown in GUI and drift events
+#   - drive_position:     Tinkerforge step count at this position
+#   - expected_roll_deg:  IMU roll angle captured during calibration
+#   - expected_pitch_deg: IMU pitch angle captured during calibration
+#   - active_angle:       which angle to use for drift check ("roll" or "pitch")
+
+drift_threshold_deg: 2.0   # degrees of drift before auto-correction triggers
+
+checkpoints:
+  cam1:
+    b: []   # add via GUI or manually
+  cam2:
+    b: []   # add via GUI or manually
+
+steps_per_degree:
+  cam1_b: 120.0   # steps per degree of rotation — calibrate via GUI
+  cam2_b: 120.0

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OAK Drive Controller
+Comment=Start the OAK-D drive controller GUI (http://localhost:8080)
+Icon=utilities-terminal
+Exec=lxterminal --title="OAK Drive Controller" -e __PROJECT_DIR__/start.sh
+Path=__PROJECT_DIR__
+Terminal=false
+StartupNotify=false
+Categories=Utility;

@@ -30,12 +30,19 @@ MONITORING_CONNECTIVITY = "monitoring/connectivity"
 # --- Configuration ---
 CONFIG_SEQUENCE_ACTIVE = "config/sequence/active"
 
+# --- IMU / Drift Detection ---
+TELEMETRY_IMU         = "telemetry/cam/{cam_id}/imu"
+CMD_IMU_CHECK         = "cmd/cam/{cam_id}/imu_check"
+EVENT_DRIFT           = "event/drift/{cam_id}/{axis}"
+
 # --- Wildcards for subscriptions ---
-SUB_ALL_DRIVE_STATUS = "status/drives/+/position"
+SUB_ALL_DRIVE_STATUS  = "status/drives/+/position"
 SUB_ALL_CAMERA_STATUS = "status/cameras/+/state"
-SUB_ALL_HEALTH = "health/#"
-SUB_ALL_ERRORS = "error/#"
-SUB_ALL_DRIVE_CMDS = "cmd/drives/+/+"
+SUB_ALL_HEALTH        = "health/#"
+SUB_ALL_ERRORS        = "error/#"
+SUB_ALL_DRIVE_CMDS    = "cmd/drives/+/+"
+SUB_ALL_IMU_TELEMETRY = "telemetry/cam/+/imu"
+SUB_ALL_IMU_CHECKS    = "cmd/cam/+/imu_check"   # used on Windows side
 
 
 def topic(template: str, **kwargs: str) -> str:

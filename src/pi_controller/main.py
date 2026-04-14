@@ -18,6 +18,7 @@ import yaml
 from src.pi_controller.drives.base import BaseDrive, DriveState
 from src.pi_controller.drives.gpio_drive import GPIODrive
 from src.pi_controller.drives.tinkerforge_drive import TinkerforgeDrive
+from src.pi_controller.imu.drift_detector import DriftDetector
 from src.shared.models import (
     DriveError,
     DrivePosition,
@@ -33,6 +34,7 @@ from src.shared.mqtt_topics import (
     HEALTH_PI,
     STATUS_DRIVE_POSITION,
     SUB_ALL_DRIVE_CMDS,
+    SUB_ALL_IMU_TELEMETRY,
     topic,
 )
 
@@ -66,6 +68,7 @@ class DriveManager:
         self.mqtt = mqtt
         self.drives: dict[str, BaseDrive] = {}
         self.settling_delay_ms: int = config.get("settling_delay_ms", 150)
+        self.drift_detector: DriftDetector | None = None
         self._sequence_running = False
         self._sequence_stop = asyncio.Event()
         self._init_drives()
@@ -126,6 +129,17 @@ class DriveManager:
 
             # Wait settling time
             await asyncio.sleep(self.settling_delay_ms / 1000.0)
+
+            # IMU drift check — axis_b Tinkerforge radial drives only
+            if (
+                axis == "b"
+                and self.drift_detector is not None
+                and payload.get("checkpoint_name")
+                and isinstance(drive, TinkerforgeDrive)
+            ):
+                await self.drift_detector.check_and_correct(
+                    cam_id, drive, payload["checkpoint_name"]
+                )
 
             # Publish reached state
             await self._publish_position(drive, sequence_id)
@@ -359,6 +373,10 @@ async def _setup_controller(config: dict, host: str, port: int) -> tuple[DriveMa
     drive_mgr = DriveManager(config, mqtt)
     await drive_mgr.setup_all()
 
+    drift_detector = DriftDetector(mqtt, Path("config/imu_calibration.yaml"))
+    drive_mgr.drift_detector = drift_detector
+    mqtt.subscribe(SUB_ALL_IMU_TELEMETRY, drift_detector.on_imu_message)
+
     async def dispatch_command(topic_str: str, payload: dict) -> None:
         if topic_str.endswith("/move"):
             await drive_mgr.handle_move(topic_str, payload)
@@ -414,8 +432,12 @@ def run_controller_with_gui(
     # Pre-create DriveManager (drives not yet initialized)
     drive_mgr = DriveManager(config, mqtt)
 
+    # DriftDetector is constructed synchronously (no asyncio objects in __init__)
+    drift_detector = DriftDetector(mqtt, Path("config/imu_calibration.yaml"))
+    drive_mgr.drift_detector = drift_detector
+
     # Register all GUI pages
-    gui_cfg = setup_gui(drive_mgr, config, config.get("gui", {}))
+    gui_cfg = setup_gui(drive_mgr, config, config.get("gui", {}), drift_detector=drift_detector)
 
     # Wire up MQTT command dispatch
     async def dispatch_command(topic_str: str, payload: dict) -> None:
@@ -428,9 +450,10 @@ def run_controller_with_gui(
 
     mqtt.subscribe(SUB_ALL_DRIVE_CMDS, dispatch_command)
 
-    # Async startup: init GPIO/Tinkerforge, start MQTT + heartbeat
+    # Async startup: init GPIO/Tinkerforge, subscribe IMU, start MQTT + heartbeat
     async def on_startup() -> None:
         await drive_mgr.setup_all()
+        mqtt.subscribe(SUB_ALL_IMU_TELEMETRY, drift_detector.on_imu_message)
         asyncio.create_task(mqtt.run())
         asyncio.create_task(heartbeat_loop(mqtt, drive_mgr))
         logger.info("background_tasks.started")

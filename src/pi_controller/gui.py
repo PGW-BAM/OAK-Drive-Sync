@@ -21,6 +21,7 @@ from nicegui import ui, app
 from src.shared.models import PositionPreset
 
 if TYPE_CHECKING:
+    from src.pi_controller.imu.drift_detector import DriftDetector
     from src.pi_controller.main import DriveManager
 
 logger = structlog.get_logger()
@@ -79,7 +80,12 @@ def apply_calibration(drive_mgr: DriveManager) -> None:
 # GUI Application
 # ──────────────────────────────────────────────
 
-def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
+def setup_gui(
+    drive_mgr: DriveManager,
+    config: dict,
+    gui_cfg: dict,
+    drift_detector: DriftDetector | None = None,
+) -> dict:
     """Register all NiceGUI pages. Call before ui.run().
 
     Returns gui_cfg for use by run_gui().
@@ -651,6 +657,192 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
                     sl.text = f"({d.state.value})"
 
                 ui.timer(0.2, update_cal_labels)
+
+        # ── IMU Calibration Section ──────────────
+        ui.separator().classes("mt-8")
+        ui.label("IMU Drift Calibration").classes("text-2xl font-bold mt-4")
+        ui.markdown(
+            "Define up to 4 named checkpoints per radial drive (axis **b**). "
+            "When a `MoveCommand` includes the checkpoint name, the Pi requests "
+            "a fresh IMU angle from the Windows controller and auto-corrects any drift.\n\n"
+            "**Requires the Windows controller to be running and connected.**"
+        ).classes("text-gray-600 mb-2")
+
+        if drift_detector is None:
+            ui.label("DriftDetector not initialized — restart with GUI mode.").classes(
+                "text-red-500 font-bold"
+            )
+        else:
+            # Global settings card
+            with ui.card().classes("w-full mt-2"):
+                ui.label("Global Settings").classes("font-bold text-lg")
+                with ui.row().classes("items-end gap-4 mt-1"):
+                    threshold_input = ui.number(
+                        label="Drift threshold (°)",
+                        value=drift_detector.get_drift_threshold(),
+                        min=0.1,
+                        max=45.0,
+                        step=0.1,
+                        format="%.1f",
+                    ).classes("w-44")
+
+                    def save_threshold(inp=threshold_input):
+                        drift_detector.set_drift_threshold(float(inp.value or 2.0))
+                        ui.notify("Drift threshold saved", type="positive")
+
+                    ui.button("Save", on_click=save_threshold).props("color=primary size=sm")
+
+            # Per-camera IMU calibration (cam1:b and cam2:b only)
+            for cam_id in ("cam1", "cam2"):
+                drive_key = f"{cam_id}:b"
+                drive = drive_mgr.drives.get(drive_key)
+                if drive is None:
+                    continue
+
+                with ui.card().classes("w-full mt-4"):
+                    ui.label(f"Checkpoints — {drive_key}").classes(
+                        "font-bold text-blue-700 text-lg"
+                    )
+
+                    # Live IMU angle display
+                    with ui.row().classes("gap-6 items-center mt-1"):
+                        roll_label = ui.label("Roll: —").classes("font-mono text-sm")
+                        pitch_label = ui.label("Pitch: —").classes("font-mono text-sm")
+                        imu_status = ui.label("(no data)").classes(
+                            "text-xs text-gray-400"
+                        )
+
+                    def update_imu_display(
+                        rl=roll_label, pl=pitch_label, sl=imu_status, cid=cam_id
+                    ):
+                        angle = drift_detector.get_latest_imu(cid)
+                        if angle:
+                            rl.text = f"Roll: {angle.roll_deg:.2f}°"
+                            pl.text = f"Pitch: {angle.pitch_deg:.2f}°"
+                            sl.text = f"(updated {angle.timestamp.strftime('%H:%M:%S')})"
+                        else:
+                            rl.text = "Roll: —"
+                            pl.text = "Pitch: —"
+                            sl.text = "(no data — is Windows controller running?)"
+
+                    ui.timer(0.5, update_imu_display)
+
+                    # Steps-per-degree
+                    with ui.row().classes("items-end gap-4 mt-3"):
+                        spd_input = ui.number(
+                            label="Steps per degree",
+                            value=drift_detector.get_steps_per_degree(cam_id),
+                            min=0.1,
+                            max=10000.0,
+                            step=1.0,
+                            format="%.1f",
+                        ).classes("w-48")
+                        ui.label(
+                            "Move between two positions, note the step delta and angle "
+                            "delta, then enter: steps ÷ degrees."
+                        ).classes("text-xs text-gray-500 max-w-xs")
+
+                        def save_spd(cid=cam_id, inp=spd_input):
+                            drift_detector.set_steps_per_degree(cid, float(inp.value or 120.0))
+                            ui.notify(
+                                f"Steps/degree saved for {cid}:b", type="positive"
+                            )
+
+                        ui.button("Save", on_click=save_spd).props("color=primary size=sm")
+
+                    # Checkpoint table
+                    ui.separator().classes("mt-3")
+                    ui.label("Defined Checkpoints").classes("font-bold text-sm mt-1")
+                    checkpoints_col = ui.column().classes("w-full")
+
+                    def refresh_table(cid=cam_id, col=checkpoints_col):
+                        col.clear()
+                        cps = drift_detector.get_checkpoints(cid)
+                        with col:
+                            if not cps:
+                                ui.label("No checkpoints yet.").classes(
+                                    "text-gray-400 text-sm"
+                                )
+                                return
+                            with ui.grid(columns=5).classes("w-full gap-1 text-sm"):
+                                for header in (
+                                    "Name", "Drive Position", "Expected Angle", "Active", ""
+                                ):
+                                    ui.label(header).classes("font-bold text-xs text-gray-600")
+                                for cp in cps:
+                                    active = cp["active_angle"]
+                                    expected = cp.get(f"expected_{active}_deg", "—")
+                                    ui.label(cp["name"]).classes("text-sm")
+                                    ui.label(str(cp["drive_position"])).classes("text-sm font-mono")
+                                    ui.label(f"{expected}°").classes("text-sm font-mono")
+                                    ui.label(active).classes("text-sm")
+
+                                    def delete_cp(n=cp["name"], cid2=cid, col2=col):
+                                        drift_detector.delete_checkpoint(cid2, n)
+                                        refresh_table(cid2, col2)
+                                        ui.notify(f"Deleted '{n}'", type="warning")
+
+                                    ui.button("Delete", on_click=delete_cp).props(
+                                        "color=red size=xs flat dense"
+                                    )
+
+                    refresh_table()
+
+                    # Add checkpoint form
+                    ui.separator().classes("mt-3")
+                    ui.label("Add / Update Checkpoint").classes("font-bold text-sm mt-1")
+                    with ui.row().classes("items-end gap-2 mt-1 flex-wrap"):
+                        cp_name = ui.input(
+                            label="Name",
+                            placeholder="e.g. top_view",
+                        ).classes("w-36")
+                        active_angle_sel = ui.select(
+                            label="Active angle",
+                            options=["roll", "pitch"],
+                            value="roll",
+                        ).classes("w-28")
+
+                        async def capture_checkpoint(
+                            cid=cam_id,
+                            d=drive,
+                            name_inp=cp_name,
+                            ang_sel=active_angle_sel,
+                            col=checkpoints_col,
+                        ):
+                            name = name_inp.value.strip()
+                            if not name:
+                                ui.notify(
+                                    "Please enter a checkpoint name", type="warning"
+                                )
+                                return
+                            angle = drift_detector.get_latest_imu(cid)
+                            if angle is None:
+                                ui.notify(
+                                    "No IMU data available — is the Windows controller "
+                                    "running and connected?",
+                                    type="negative",
+                                )
+                                return
+                            drift_detector.calibrate_checkpoint(
+                                cid,
+                                name,
+                                d.current_position,
+                                angle,
+                                active_angle=ang_sel.value,
+                            )
+                            name_inp.value = ""
+                            refresh_table(cid, col)
+                            ui.notify(
+                                f"Checkpoint '{name}' saved at position "
+                                f"{d.current_position:.0f} "
+                                f"({ang_sel.value}: "
+                                f"{angle.roll_deg if ang_sel.value == 'roll' else angle.pitch_deg:.2f}°)",
+                                type="positive",
+                            )
+
+                        ui.button(
+                            "Capture Here", on_click=capture_checkpoint
+                        ).props("color=teal")
 
     # ── Settings Tab ───────────────────────────
 

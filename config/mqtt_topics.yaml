@@ -129,3 +129,41 @@ topics:
     description: >
       The currently active capture sequence definition.
       Published when a new sequence is started.
+
+  # ── IMU / Drift Detection ────────────────────
+  - topic: "telemetry/cam/{cam_id}/imu"
+    direction: "win → pi"
+    qos: 0
+    retained: false
+    payload_model: IMUAngle
+    interval_s: 0.5
+    description: >
+      Camera IMU angle (roll + pitch in degrees), computed from the OAK-D
+      onboard accelerometer by the Windows controller. Published continuously
+      at ~2 Hz for live monitoring AND immediately in response to an
+      imu_check request (with request_id echoed for correlation).
+      cam_id: cam1 | cam2
+
+  - topic: "cmd/cam/{cam_id}/imu_check"
+    direction: "pi → win"
+    qos: 1
+    retained: false
+    payload_model: IMUCheckRequest
+    description: >
+      Sent by the Pi after a Tinkerforge radial drive (axis_b) reaches a
+      named checkpoint position (post-settling delay). Requests an immediate
+      fresh IMU reading. The Windows controller responds by publishing to
+      telemetry/cam/{cam_id}/imu with the matching request_id.
+      cam_id: cam1 | cam2
+
+  - topic: "event/drift/{cam_id}/{axis}"
+    direction: "pi → win"
+    qos: 1
+    retained: false
+    payload_model: DriftDetectionEvent
+    description: >
+      Published by the Pi when a Tinkerforge radial drive has drifted beyond
+      the configured threshold (drift_threshold_deg in imu_calibration.yaml).
+      Includes the drift amount, correction steps applied, and whether the
+      auto-correction move succeeded. axis is always "b".
+      cam_id: cam1 | cam2
