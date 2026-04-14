@@ -26,12 +26,6 @@ logger = structlog.get_logger()
 try:
     from gpiozero import Device, LED
     from gpiozero.exc import GPIOZeroError
-    # On Pi 5, gpiozero 2.x auto-detects lgpio as the default factory because
-    # RPi.GPIO does not support Pi 5. Forcing LGPIOFactory() explicitly can
-    # crash the import if the GPIO chip is unavailable at import time, causing
-    # all drives to silently fall into simulation mode.
-    # We still try to set lgpio explicitly for clarity, but any failure is
-    # ignored — gpiozero's auto-detection handles it correctly on Pi 5.
     try:
         from gpiozero.pins.lgpio import LGPIOFactory
         Device.pin_factory = LGPIOFactory()
@@ -44,20 +38,12 @@ except ImportError:
     logger.warning("gpiozero not available — GPIO drive will run in simulation mode")
 
 
-# Pulse half-period matching the proven working reference script:
-# 10µs high + 10µs low = 20µs per step
+# Pulse half-period: 10µs high + 10µs low = 20µs per step
 DEFAULT_PULSE_DELAY = 0.00001
-
-# Log a heartbeat every N steps so the Pi log shows real motion progress.
-_PROGRESS_LOG_INTERVAL = 10_000
 
 
 class GPIODrive(BaseDrive):
-    """Linear motor controlled via PUL + DIR GPIO pins.
-
-    Generates step pulses using a blocking for-loop with time.sleep()
-    running in a separate thread, identical to the working reference script.
-    """
+    """Linear motor controlled via PUL + DIR GPIO pins."""
 
     def __init__(
         self,
@@ -84,19 +70,18 @@ class GPIODrive(BaseDrive):
         self.pulse_delay = pulse_delay
 
         self._pul: LED | None = None
-        self._dir_pin_dev: LED | None = None
+        self._dir: LED | None = None
         self._stop_flag = threading.Event()
         self._async_stop = asyncio.Event()
         self._simulated = LED is None
         self._setup_error: str | None = None
 
-        # _thread_done is SET when no thread is running (or the last thread
-        # has finished).  move_to waits on it before starting a new thread,
-        # which prevents two _step_loop threads from pulsing simultaneously.
+        # Tracks whether the _step_loop thread is still running.
+        # Prevents two threads from pulsing the same GPIO pin simultaneously.
         self._thread_done = threading.Event()
-        self._thread_done.set()
+        self._thread_done.set()  # no thread running initially
 
-    # ── Public properties ──────────────────────────────────────────────────
+    # ── Properties ────────────────────────────────────────────────────────
 
     @property
     def is_simulated(self) -> bool:
@@ -104,34 +89,29 @@ class GPIODrive(BaseDrive):
 
     @property
     def setup_error(self) -> str | None:
-        """Human-readable reason why this drive is in simulation mode, or None."""
         return self._setup_error
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     async def setup(self) -> None:
         if self._simulated and self._setup_error is None:
-            # gpiozero not importable — nothing to retry
+            # gpiozero not importable on this platform
             logger.info("gpio_drive.setup_simulated", key=self.key)
             return
 
-        # Close any existing pins before (re-)initialising
-        if self._pul is not None:
-            try:
-                self._pul.close()
-            except Exception:
-                pass
-            self._pul = None
-        if self._dir_pin_dev is not None:
-            try:
-                self._dir_pin_dev.close()
-            except Exception:
-                pass
-            self._dir_pin_dev = None
+        # Close existing pins if re-initialising
+        for attr in ("_pul", "_dir"):
+            dev = getattr(self, attr, None)
+            if dev is not None:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
         try:
             self._pul = LED(self.step_pin)
-            self._dir_pin_dev = LED(self.dir_pin)
+            self._dir = LED(self.dir_pin)
             self._simulated = False
             self._setup_error = None
         except Exception as exc:
@@ -139,7 +119,7 @@ class GPIODrive(BaseDrive):
             self._setup_error = error_msg
             self._simulated = True
             logger.error(
-                "gpio_drive.setup_failed — falling back to SIMULATION",
+                "gpio_drive.setup_failed",
                 key=self.key,
                 error=error_msg,
             )
@@ -157,7 +137,7 @@ class GPIODrive(BaseDrive):
 
     async def cleanup(self) -> None:
         self.emergency_stop()
-        # Wait for any running thread to finish before closing the GPIO objects.
+        # Wait for the pulse thread to finish before closing GPIO objects
         if not self._thread_done.is_set():
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self._thread_done.wait, 1.0)
@@ -165,32 +145,33 @@ class GPIODrive(BaseDrive):
             self._pul.off()
             self._pul.close()
             self._pul = None
-        if self._dir_pin_dev is not None:
-            self._dir_pin_dev.off()
-            self._dir_pin_dev.close()
-            self._dir_pin_dev = None
+        if self._dir is not None:
+            self._dir.off()
+            self._dir.close()
+            self._dir = None
         logger.info("gpio_drive.cleanup", key=self.key)
 
     # ── Step loop (runs in thread) ─────────────────────────────────────────
 
     def _step_loop(self, steps: int, direction: int, delta: float) -> int:
-        """Blocking step pulse loop — runs in a thread via run_in_executor.
+        """Blocking pulse loop — identical to the working reference script.
 
-        Returns the number of steps actually completed.
-        Always sets _thread_done on exit so move_to can serialise threads.
+        dir.on/off → for loop: pul.on, sleep, pul.off, sleep
+
+        Always sets _thread_done in finally so move_to can serialise threads.
         """
         try:
             pul = self._pul
-            dir_dev = self._dir_pin_dev
+            dir_dev = self._dir
             delay = self.pulse_delay
             position_per_step = delta / steps
             start_pos = self._current_position
 
             if pul is None:
-                logger.error("gpio_drive._step_loop called but pul is None", key=self.key)
+                logger.error("gpio_drive._step_loop: pul is None", key=self.key)
                 return 0
 
-            # Set direction before pulsing
+            # Set direction once before pulsing — same as reference script
             forward = direction > 0
             if self.invert_direction:
                 forward = not forward
@@ -202,12 +183,6 @@ class GPIODrive(BaseDrive):
 
             for i in range(steps):
                 if self._stop_flag.is_set():
-                    logger.info(
-                        "gpio_drive._step_loop.stopped",
-                        key=self.key,
-                        steps_done=i,
-                        steps_total=steps,
-                    )
                     return i
 
                 pul.on()
@@ -217,20 +192,11 @@ class GPIODrive(BaseDrive):
 
                 self._current_position = start_pos + (i + 1) * position_per_step
 
-                # Periodic heartbeat so the Pi log shows real motion
-                if (i + 1) % _PROGRESS_LOG_INTERVAL == 0:
-                    logger.debug(
-                        "gpio_drive._step_loop.progress",
-                        key=self.key,
-                        steps_done=i + 1,
-                        steps_total=steps,
-                        position=self._current_position,
-                    )
-
             return steps
 
         finally:
-            # Always signal that this thread has exited — even on exception.
+            # Always signal completion so the next move_to doesn't start a
+            # second thread while this one is still pulsing.
             self._thread_done.set()
 
     # ── Move logic ─────────────────────────────────────────────────────────
@@ -241,6 +207,9 @@ class GPIODrive(BaseDrive):
                 position = max(self._home_position, min(self._max_position, position))
 
             self._target_position = position
+            self._state = DriveState.MOVING
+            self._stop_flag.clear()
+            self._async_stop.clear()
 
             delta = position - self._current_position
             if abs(delta) < 1e-6:
@@ -265,35 +234,32 @@ class GPIODrive(BaseDrive):
             )
 
             if self._simulated:
-                self._state = DriveState.MOVING
                 await self._simulate_move(position, steps)
                 return
 
-            # ── Ensure the previous thread has exited before pulsing again ──
-            # This prevents two threads from toggling the same GPIO pin
-            # simultaneously, which caused erratic behaviour.
             loop = asyncio.get_running_loop()
-            if not self._thread_done.is_set():
-                logger.debug("gpio_drive.waiting_for_previous_thread", key=self.key)
-                self._stop_flag.set()  # ask old thread to stop
-                await loop.run_in_executor(None, self._thread_done.wait, 1.0)
-                if not self._thread_done.is_set():
-                    logger.error("gpio_drive.previous_thread_timeout", key=self.key)
 
-            self._thread_done.clear()   # this thread is starting
-            self._stop_flag.clear()
-            self._async_stop.clear()
-            self._state = DriveState.MOVING
+            # Wait for any previous thread to exit before starting a new one.
+            # Without this, rapid jogs or cancelled moves leave a ghost thread
+            # pulsing the same pin — causing the motor to stall or behave
+            # erratically.  The thread always sets _thread_done in its finally.
+            if not self._thread_done.is_set():
+                logger.debug("gpio_drive.waiting_for_prev_thread", key=self.key)
+                self._stop_flag.set()   # ask old thread to exit early
+                await loop.run_in_executor(None, self._thread_done.wait, 2.0)
+                self._stop_flag.clear()  # ready for the new thread
+
+            self._thread_done.clear()  # mark new thread as in-flight
 
             try:
                 steps_done = await loop.run_in_executor(
                     None, self._step_loop, steps, direction, delta
                 )
             except asyncio.CancelledError:
-                # NiceGUI may cancel button-handler tasks on disconnect / navigation.
-                # Signal the thread to stop, but do NOT re-raise — re-raising propagates
-                # the cancel up to NiceGUI which can put the drive in an unrecoverable
-                # state from the GUI's perspective.  Just treat it as a soft stop.
+                # NiceGUI cancels button handlers on disconnect / tab navigation.
+                # Signal the thread to stop, but do NOT re-raise — re-raising
+                # propagates the cancellation to NiceGUI and leaves the drive
+                # in a broken state for subsequent jog presses.
                 self._stop_flag.set()
                 self._state = DriveState.IDLE
                 logger.warning("gpio_drive.move_cancelled", key=self.key)
@@ -321,7 +287,6 @@ class GPIODrive(BaseDrive):
     # ── Simulated movement ─────────────────────────────────────────────────
 
     async def _simulate_move(self, target: float, steps: int) -> None:
-        """Simulated movement for development without GPIO hardware."""
         total_time = steps * self.pulse_delay * 2
         sim_time = min(total_time, 3.0)
         elapsed = 0.0
@@ -334,8 +299,7 @@ class GPIODrive(BaseDrive):
                 return
             await asyncio.sleep(0.05)
             elapsed += 0.05
-            progress = min(elapsed / sim_time, 1.0)
-            self._current_position = start_pos + delta * progress
+            self._current_position = start_pos + delta * min(elapsed / sim_time, 1.0)
 
         self._current_position = target
         self._state = DriveState.REACHED
@@ -344,13 +308,10 @@ class GPIODrive(BaseDrive):
     # ── Homing ─────────────────────────────────────────────────────────────
 
     async def home(self) -> None:
-        """Home to position 0. No limit switches — software only."""
         self._state = DriveState.HOMING
         logger.info("gpio_drive.homing", key=self.key)
-
         if self._current_position != self._home_position:
             await self.move_to(self._home_position, speed=0.3)
-
         self._current_position = self._home_position
         self._state = DriveState.IDLE
         logger.info("gpio_drive.homed", key=self.key)

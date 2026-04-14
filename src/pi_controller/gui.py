@@ -182,11 +182,10 @@ def setup_gui(
                             "text-red-600 font-bold text-sm"
                         )
                         if drive.is_simulated:
-                            sim_b = ui.badge("SIMULATED").props("color=red").classes(
+                            err = drive.setup_error or "unknown — check Pi logs"
+                            with ui.badge("SIMULATED").props("color=red").classes(
                                 "text-xs font-bold cursor-help"
-                            )
-                            with sim_b:
-                                err = drive.setup_error or "unknown — check Pi logs"
+                            ):
                                 ui.tooltip(f"GPIO init failed: {err}")
                         drive_cards[key]["state"] = ui.label(f"State: {drive.state.value}")
                         drive_cards[key]["position"] = ui.label(
@@ -624,15 +623,14 @@ def setup_gui(
                     # Show a prominent warning if the drive is running in simulation mode —
                     # position changes in the GUI but the motor does NOT physically move.
                     if drive.is_simulated:
-                        error_detail = drive.setup_error or "unknown error — check Pi logs"
-                        sim_badge = ui.badge("SIMULATED — no real GPIO").props(
+                        err_detail = drive.setup_error or "unknown — check Pi logs"
+                        with ui.badge("SIMULATED — no real GPIO").props(
                             "color=red"
-                        ).classes("text-sm font-bold cursor-help")
-                        with sim_badge:
+                        ).classes("text-sm font-bold cursor-help"):
                             ui.tooltip(
-                                f"GPIO init failed: {error_detail}\n"
-                                "Position updates are fake — the motor is NOT moving.\n"
-                                "Fix the wiring/permissions then click Reinitialize."
+                                f"GPIO init failed: {err_detail} — "
+                                "position updates are fake, motor is NOT moving. "
+                                "Fix wiring/permissions then click Reinitialize."
                             )
 
                     min_label = ui.label(
@@ -728,33 +726,32 @@ def setup_gui(
                         "color=amber size=sm"
                     )
 
-                    async def reinitialize_drive(d=drive, k=key):
-                        """Re-run GPIO setup without restarting the service.
+                    # Reinitialize only makes sense for GPIO drives (not Tinkerforge)
+                    from src.pi_controller.drives.gpio_drive import GPIODrive
+                    if isinstance(drive, GPIODrive):
+                        async def reinitialize_drive(d=drive, k=key):
+                            """Re-run GPIO setup without restarting the service."""
+                            ui.notify(f"Reinitializing {k}…", type="info")
+                            try:
+                                await d.cleanup()
+                                await d.setup()
+                            except Exception as exc:
+                                ui.notify(
+                                    f"{k} reinitialize failed: {exc}", type="negative"
+                                )
+                                return
+                            if d.is_simulated:
+                                ui.notify(
+                                    f"{k} still simulated: {d.setup_error}", type="warning"
+                                )
+                            else:
+                                ui.notify(
+                                    f"{k} GPIO init OK — motor is live", type="positive"
+                                )
 
-                        Useful when drive 2 shows SIMULATED after fixing wiring or
-                        after a GPIO permission issue has been resolved.
-                        """
-                        ui.notify(f"Reinitializing {k}…", type="info")
-                        try:
-                            await d.cleanup()
-                            await d.setup()
-                        except Exception as exc:
-                            ui.notify(
-                                f"{k} reinitialize failed: {exc}", type="negative"
-                            )
-                            return
-                        if d.is_simulated:
-                            ui.notify(
-                                f"{k} still simulated: {d.setup_error}", type="warning"
-                            )
-                        else:
-                            ui.notify(
-                                f"{k} GPIO init OK — motor is live", type="positive"
-                            )
-
-                    ui.button("Reinitialize", on_click=reinitialize_drive).props(
-                        "color=indigo size=sm"
-                    )
+                        ui.button("Reinitialize", on_click=reinitialize_drive).props(
+                            "color=indigo size=sm"
+                        )
 
                 # Live position update — also colours state label red on FAULT
                 def update_cal_labels(pl=pos_label, sl=state_label, d=drive):
