@@ -86,6 +86,10 @@ class GPIODrive(BaseDrive):
         self._async_stop = asyncio.Event()
         self._simulated = LED is None
 
+    @property
+    def is_simulated(self) -> bool:
+        return self._simulated
+
     async def setup(self) -> None:
         if self._simulated:
             logger.info("gpio_drive.setup_simulated", key=self.key)
@@ -219,7 +223,16 @@ class GPIODrive(BaseDrive):
                 self._state = DriveState.REACHED
                 logger.info("gpio_drive.move_complete", key=self.key, position=position)
 
+            except asyncio.CancelledError:
+                # NiceGUI cancels coroutines on tab navigation / websocket disconnect.
+                # The executor thread keeps running unless we signal it to stop.
+                self._stop_flag.set()
+                self._state = DriveState.IDLE
+                logger.warning("gpio_drive.move_cancelled", key=self.key)
+                raise
             except Exception as exc:
+                # On any GPIO error, stop the thread so it doesn't keep pulsing.
+                self._stop_flag.set()
                 self._state = DriveState.FAULT
                 logger.error("gpio_drive.move_error", key=self.key, error=str(exc))
                 raise

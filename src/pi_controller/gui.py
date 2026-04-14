@@ -181,6 +181,10 @@ def setup_gui(
                         drive_cards[key]["cal"] = ui.label("NOT CALIBRATED").classes(
                             "text-red-600 font-bold text-sm"
                         )
+                        if drive.is_simulated:
+                            ui.badge("SIMULATED").props("color=red").classes(
+                                "text-xs font-bold"
+                            )
                         drive_cards[key]["state"] = ui.label(f"State: {drive.state.value}")
                         drive_cards[key]["position"] = ui.label(
                             f"Position: {drive.current_position:.1f}"
@@ -614,6 +618,17 @@ def setup_gui(
                     )
                     state_label = ui.label(f"({drive.state.value})").classes("w-20")
 
+                    # Show a prominent warning if the drive is running in simulation mode —
+                    # position changes in the GUI but the motor does NOT physically move.
+                    if drive.is_simulated:
+                        ui.badge("SIMULATED — no real GPIO").props("color=red").classes(
+                            "text-sm font-bold"
+                        )
+                        ui.tooltip(
+                            "GPIO init failed at startup. Check the Pi logs for the error. "
+                            "Position updates are fake — the motor is not moving."
+                        )
+
                     min_label = ui.label(
                         f"Min: {drive.get_min_position():.0f}" if drive.min_calibrated else "Min: —"
                     ).classes("text-orange-700 font-bold w-28")
@@ -696,10 +711,26 @@ def setup_gui(
 
                     ui.button("STOP", on_click=stop_drive).props("color=red")
 
-                # Live position update
+                    def reset_fault(d=drive, k=key):
+                        """Clear FAULT state so jog buttons work again."""
+                        from src.pi_controller.drives.base import DriveState
+                        if d.state == DriveState.FAULT:
+                            d._state = DriveState.IDLE
+                            ui.notify(f"{k} fault cleared — ready to jog", type="warning")
+
+                    ui.button("Clear Fault", on_click=reset_fault).props(
+                        "color=amber size=sm"
+                    )
+
+                # Live position update — also colours state label red on FAULT
                 def update_cal_labels(pl=pos_label, sl=state_label, d=drive):
                     pl.text = f"Position: {d.current_position:.1f}"
-                    sl.text = f"({d.state.value})"
+                    state_text = d.state.value
+                    sl.text = f"({state_text})"
+                    if state_text == "fault":
+                        sl.classes(replace="w-20 text-red-600 font-bold")
+                    else:
+                        sl.classes(replace="w-20")
 
                 ui.timer(0.2, update_cal_labels)
 

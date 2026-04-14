@@ -110,3 +110,8 @@ class BaseDrive(ABC):
         """Pre-seed current position from persisted log at startup.
         Only call before any movement has occurred."""
         self._current_position = value
+
+    @property
+    def is_simulated(self) -> bool:
+        """True if the drive is running in software simulation (no real hardware)."""
+        return False
