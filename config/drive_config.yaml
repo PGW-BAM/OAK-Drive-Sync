@@ -36,8 +36,8 @@ drives:
   cam2:
     axis_a:                       # GPIO linear motor — PUL + DIR pin control
       type: gpio
-      step_pin: 15                # PUL2 — GPIO 15 (physical pin 10)
-      dir_pin: 17                 # DIR2 — GPIO 17 (physical pin 11)
+      step_pin: 16                # PUL2 — GPIO 16
+      dir_pin: 17                 # DIR2 — GPIO 17
       steps_per_unit: 200
       max_speed: 1000
       invert_direction: false

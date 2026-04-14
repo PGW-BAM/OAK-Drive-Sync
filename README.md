@@ -24,7 +24,7 @@ Raspberry Pi 5 (Mosquitto Broker + Drive Controller + Web GUI)
 |---------|---------------|-----------------------------|--------------|
 | cam1:a  | GPIO linear   | PUL=GPIO 14, DIR=GPIO 15    | 0 – configurable |
 | cam1:b  | Tinkerforge   | Silent Stepper (UID: 2eoB)  | 0 – calibrated   |
-| cam2:a  | GPIO linear   | PUL=GPIO 15, DIR=GPIO 17    | 0 – configurable |
+| cam2:a  | GPIO linear   | PUL=GPIO 16, DIR=GPIO 17    | 0 – configurable |
 | cam2:b  | Tinkerforge   | Silent Stepper (UID: 2eoz)  | 0 – calibrated   |
 
 ## Quick Start — Raspberry Pi
