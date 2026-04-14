@@ -73,7 +73,7 @@ class TinkerforgeDrive(BaseDrive):
         self._stepper = BrickletSilentStepperV2(self.uid, self._ipcon)
 
         # Connect in a thread to avoid blocking the event loop
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None, self._ipcon.connect, self.host, self.port
         )
@@ -130,7 +130,7 @@ class TinkerforgeDrive(BaseDrive):
         if self._stepper is not None:
             self._stepper.set_enabled(False)
         if self._ipcon is not None:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self._ipcon.disconnect)
             self._ipcon = None
             self._stepper = None

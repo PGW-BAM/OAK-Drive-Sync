@@ -519,16 +519,11 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
                 ui.link("Calibration", "/calibration").classes("text-white")
                 ui.link("Settings", "/settings").classes("text-white")
 
-        # Enable calibration mode (bypasses position clamping)
+        # Enable calibration mode (bypasses position clamping).
+        # Set here for the initial state and also inside each jog handler,
+        # because app.on_disconnect fires on tab navigation and would reset it.
         for d in drive_mgr.drives.values():
             d.calibration_mode = True
-
-        def on_leave():
-            for d in drive_mgr.drives.values():
-                d.calibration_mode = False
-
-        # Disable calibration mode when navigating away
-        app.on_disconnect(on_leave)
 
         ui.label("Drive Calibration").classes("text-2xl font-bold")
         ui.markdown(
@@ -585,6 +580,7 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
                     step_sizes = [1, 10, 50, 100, 500, 1000]
                     for step in step_sizes:
                         async def jog_down(d=drive, s=step):
+                            d.calibration_mode = True  # re-assert: on_disconnect can clear it
                             target = d.current_position - s
                             await d.move_to(target, 0.3)
 
@@ -596,6 +592,7 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
 
                     for step in step_sizes:
                         async def jog_up(d=drive, s=step):
+                            d.calibration_mode = True  # re-assert: on_disconnect can clear it
                             target = d.current_position + s
                             await d.move_to(target, 0.3)
 
