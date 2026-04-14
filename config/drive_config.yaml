@@ -21,6 +21,11 @@ drives:
       max_speed: 1000             # max steps/second
       invert_direction: false
       pulse_delay: 0.00001        # seconds per half-pulse (0.00001 = 10µs → 20µs/step → ~50kHz)
+      # Driver-safety timing — prevents fault-latch on rapid/reversing commands
+      dir_setup_delay: 0.010      # 10ms: DIR pin → first pulse (driver latching time)
+      post_move_delay: 0.050      # 50ms rest after every move (coil discharge)
+      direction_change_delay: 0.200  # 200ms extra gap when reversing direction
+      min_move_interval: 0.050    # 50ms minimum gap between same-direction moves
 
     axis_b:                       # Tinkerforge Silent Stepper Bricklet 2.0
       type: tinkerforge
@@ -42,6 +47,11 @@ drives:
       max_speed: 1000
       invert_direction: false
       pulse_delay: 0.00001        # seconds per half-pulse (0.00001 = 10µs → 20µs/step → ~50kHz)
+      # Driver-safety timing (same values as cam1:a)
+      dir_setup_delay: 0.010
+      post_move_delay: 0.050
+      direction_change_delay: 0.200
+      min_move_interval: 0.050
 
     axis_b:                       # Tinkerforge Silent Stepper Bricklet 2.0
       type: tinkerforge

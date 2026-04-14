@@ -405,6 +405,8 @@ async def run_controller_headless(
     drive_mgr, mqtt = await _setup_controller(config, host, port)
     seed_positions_from_log(drive_mgr)
     apply_calibration(drive_mgr)
+    from src.pi_controller.gui import auto_seed_min_calibration
+    auto_seed_min_calibration(drive_mgr)
 
     try:
         async with asyncio.TaskGroup() as tg:
@@ -460,13 +462,14 @@ def run_controller_with_gui(
 
     # Async startup: init GPIO/Tinkerforge, subscribe IMU, start MQTT + heartbeat
     async def on_startup() -> None:
-        from src.pi_controller.gui import apply_calibration
+        from src.pi_controller.gui import apply_calibration, auto_seed_min_calibration
         from src.pi_controller.position_log import rotate_log, seed_positions_from_log
 
         rotate_log()
         await drive_mgr.setup_all()
         seed_positions_from_log(drive_mgr)
         apply_calibration(drive_mgr)
+        auto_seed_min_calibration(drive_mgr)
         mqtt.subscribe(SUB_ALL_IMU_TELEMETRY, drift_detector.on_imu_message)
         asyncio.create_task(mqtt.run())
         asyncio.create_task(heartbeat_loop(mqtt, drive_mgr))

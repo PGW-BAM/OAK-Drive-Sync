@@ -32,6 +32,57 @@ CALIBRATION_FILE = Path("config/calibration.yaml")
 
 
 # ──────────────────────────────────────────────
+# Jog Coalescer
+# ──────────────────────────────────────────────
+
+class JogCoalescer:
+    """Accumulates rapid jog clicks into a single drive move.
+
+    Problem: clicking "-100" five times quickly queues five back-to-back
+    moves on the asyncio lock.  Each move includes a DIR-setup delay and
+    post-move delay, and rapid direction changes can trip the driver's
+    over-speed / direction-reversal fault latch.
+
+    Solution: accumulate deltas and run ONE move per "burst".  Five clicks
+    of -100 become one move of -500.  A click of -100 followed immediately
+    by +100 cancels out to zero — saving a useless round-trip entirely.
+    """
+
+    def __init__(self, drive: object) -> None:  # drive: BaseDrive
+        self._drive = drive
+        self._pending_delta: float = 0.0
+        self._speed: float = 0.3
+        self._worker: asyncio.Task | None = None
+
+    def request(self, delta: float, speed: float) -> None:
+        """Add a jog delta — called synchronously from a button handler."""
+        self._pending_delta += delta
+        self._speed = speed
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._run())
+
+    def cancel(self) -> None:
+        """Discard all pending jogs — call when STOP is pressed."""
+        self._pending_delta = 0.0
+        if self._worker is not None and not self._worker.done():
+            self._worker.cancel()
+
+    async def _run(self) -> None:
+        while True:
+            delta = self._pending_delta
+            if abs(delta) < 1e-6:
+                return
+            self._pending_delta = 0.0
+            target = self._drive.current_position + delta
+            try:
+                await self._drive.move_to(target, self._speed)
+            except Exception:
+                # Drive fault — drop remaining deltas and stop
+                self._pending_delta = 0.0
+                return
+
+
+# ──────────────────────────────────────────────
 # Position Persistence
 # ──────────────────────────────────────────────
 
@@ -80,6 +131,27 @@ def apply_calibration(drive_mgr: DriveManager) -> None:
             logger.info("calibration.applied", key=key, limits=limits)
 
 
+def auto_seed_min_calibration(drive_mgr: DriveManager) -> None:
+    """Auto-seed min calibration from the current startup position.
+
+    Convention: park all drives at their physical lower endpoint before
+    starting the service.  This function marks min=current_position for
+    every drive that does not already have a saved min.
+
+    Saved calibration from calibration.yaml always takes precedence —
+    this only fills in drives whose min was not restored from file.
+    """
+    for drive in drive_mgr.drives.values():
+        if not drive.min_calibrated:
+            drive.set_min_position(drive.current_position)
+            drive.min_calibrated = True
+            logger.info(
+                "calibration.min_auto_seeded",
+                key=drive.key,
+                value=drive.current_position,
+            )
+
+
 def _auto_save_calibration(drive_mgr: DriveManager) -> None:
     """Save calibration.yaml for all currently-calibrated drives (partial saves OK)."""
     cal = {
@@ -125,8 +197,11 @@ def setup_gui(
     positions: list[PositionPreset] = load_positions()
     sequence_task: asyncio.Task | None = None
 
-    # Session-only calibration — no auto-load from file.
-    # All 4 drives must be calibrated manually via the Calibration tab each startup.
+    # One JogCoalescer per drive — shared across manual and calibration pages.
+    # Coalesces rapid jog clicks into a single move to protect the stepper drivers.
+    jog_coalescers: dict[str, JogCoalescer] = {
+        key: JogCoalescer(drive) for key, drive in drive_mgr.drives.items()
+    }
 
     # ── Dashboard Tab ──────────────────────────
 
@@ -145,16 +220,16 @@ def setup_gui(
                 ui.link("Calibration", "/calibration").classes("text-white")
                 ui.link("Settings", "/settings").classes("text-white")
 
-        # Calibration banner
-        cal_banner = ui.card().classes("w-full bg-red-100 border-l-4 border-red-500")
+        # Calibration banner — shown until all drives have max calibrated
+        cal_banner = ui.card().classes("w-full bg-amber-100 border-l-4 border-amber-500")
         with cal_banner:
             with ui.row().classes("items-center gap-2"):
-                ui.icon("warning").classes("text-red-600 text-2xl")
+                ui.icon("info").classes("text-amber-600 text-2xl")
                 cal_banner_text = ui.label(
-                    "Drives not calibrated! Go to the Calibration tab before running sequences."
-                ).classes("text-red-700 font-bold")
+                    "Set upper endpoint (Max) for each drive before running sequences."
+                ).classes("text-amber-700 font-bold")
                 ui.link("Go to Calibration", "/calibration").classes(
-                    "ml-4 text-red-800 underline font-bold"
+                    "ml-4 text-amber-800 underline font-bold"
                 )
 
         # Saved calibration banner (shown only when calibration.yaml exists)
@@ -229,8 +304,11 @@ def setup_gui(
                         cards["range"].text = "Range: — (calibrate first)"
                         cards["progress"].value = 0
 
-            # Show/hide calibration banner
-            cal_banner.set_visibility(not all_calibrated)
+            # Show banner until every drive has its max endpoint calibrated
+            any_max_missing = any(
+                not d.max_calibrated for d in drive_mgr.drives.values()
+            )
+            cal_banner.set_visibility(any_max_missing)
 
             mqtt_label.text = f"MQTT: {'connected' if drive_mgr.mqtt.connected else 'disconnected'}"
             seq_label.text = f"Sequence: {'running' if drive_mgr.sequence_running else 'idle'}"
@@ -279,13 +357,11 @@ def setup_gui(
 
                     ui.button("Go", on_click=go_to).props("color=primary")
 
-                    async def jog_up(d=drive, amount=100):
-                        target = min(d.current_position + amount, d.get_max_position())
-                        await d.move_to(target, speed_slider.value)
+                    def jog_up(d=drive, k=key, amount=100):
+                        jog_coalescers[k].request(+amount, speed_slider.value)
 
-                    async def jog_down(d=drive, amount=100):
-                        target = max(d.current_position - amount, d.get_min_position())
-                        await d.move_to(target, speed_slider.value)
+                    def jog_down(d=drive, k=key, amount=100):
+                        jog_coalescers[k].request(-amount, speed_slider.value)
 
                     ui.button("+100", on_click=jog_up).props("color=teal")
                     ui.button("-100", on_click=jog_down).props("color=teal")
@@ -295,7 +371,8 @@ def setup_gui(
 
                     ui.button("Home", on_click=home_drive).props("color=orange")
 
-                    def stop_drive(d=drive):
+                    def stop_drive(d=drive, k=key):
+                        jog_coalescers[k].cancel()
                         d.emergency_stop()
 
                     ui.button("STOP", on_click=stop_drive).props("color=red")
@@ -314,7 +391,8 @@ def setup_gui(
             ui.button("Home All", on_click=home_all).props("color=orange size=lg")
 
             def stop_all():
-                for d in drive_mgr.drives.values():
+                for k, d in drive_mgr.drives.items():
+                    jog_coalescers[k].cancel()
                     d.emergency_stop()
 
             ui.button("STOP ALL", on_click=stop_all).props("color=red size=lg")
@@ -582,10 +660,13 @@ def setup_gui(
 
         ui.label("Drive Calibration").classes("text-2xl font-bold")
         ui.markdown(
-            "**Calibration is required every startup.** For each of the 4 drives:\n\n"
-            "1. Jog to the **lower physical endpoint** → click **Set as Min**\n"
-            "2. Jog to the **upper physical endpoint** → click **Set as Max**\n\n"
-            "All 4 drives must be calibrated before running sequences."
+            "**Before starting the service:** park all drives at their physical lower endpoint.\n\n"
+            "**Min is auto-set from the startup position** — no need to set it manually "
+            "unless the drive was not at the lower endpoint when the service started.\n\n"
+            "For each drive:\n"
+            "1. Jog to the **upper physical endpoint** → click **Set as Max**\n"
+            "2. Click **Save Calibration** when all drives are done\n\n"
+            "Use **Set as Min** to override the auto-seeded minimum if needed."
         ).classes("text-gray-600 mb-4")
 
         # Overall status
@@ -647,24 +728,22 @@ def setup_gui(
 
                     step_sizes = [1, 10, 50, 100, 500, 1000]
                     for step in step_sizes:
-                        async def jog_down(d=drive, s=step):
-                            d.calibration_mode = True  # re-assert: on_disconnect can clear it
-                            target = d.current_position - s
-                            await d.move_to(target, 0.3)
+                        def cal_jog_down(d=drive, k=key, s=step):
+                            d.calibration_mode = True  # re-assert each press
+                            jog_coalescers[k].request(-s, 0.3)
 
-                        ui.button(f"-{step}", on_click=jog_down).props(
+                        ui.button(f"-{step}", on_click=cal_jog_down).props(
                             "color=grey-7 size=sm dense"
                         ).classes("px-2")
 
                     ui.label("|").classes("text-gray-400")
 
                     for step in step_sizes:
-                        async def jog_up(d=drive, s=step):
-                            d.calibration_mode = True  # re-assert: on_disconnect can clear it
-                            target = d.current_position + s
-                            await d.move_to(target, 0.3)
+                        def cal_jog_up(d=drive, k=key, s=step):
+                            d.calibration_mode = True  # re-assert each press
+                            jog_coalescers[k].request(+s, 0.3)
 
-                        ui.button(f"+{step}", on_click=jog_up).props(
+                        ui.button(f"+{step}", on_click=cal_jog_up).props(
                             "color=grey-7 size=sm dense"
                         ).classes("px-2")
 
@@ -710,7 +789,8 @@ def setup_gui(
 
                     ui.button("Set Zero Here", on_click=set_zero).props("color=blue-grey")
 
-                    def stop_drive(d=drive):
+                    def stop_drive(d=drive, k=key):
+                        jog_coalescers[k].cancel()
                         d.emergency_stop()
 
                     ui.button("STOP", on_click=stop_drive).props("color=red")

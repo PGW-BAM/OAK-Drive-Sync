@@ -7,7 +7,7 @@ Pin assignments (from drive_config.yaml):
   cam1:a  — PUL=GPIO 14, DIR=GPIO 15
   cam2:a  — PUL=GPIO 16, DIR=GPIO 17
 
-Uses a blocking time.sleep() pulse loop in a thread — the same approach as the
+Uses a blocking _time.sleep() pulse loop in a thread — the same approach as the
 reference script that physically moves the motors.
 """
 
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
+import time as _time
 
 import structlog
 
@@ -58,6 +58,18 @@ class GPIODrive(BaseDrive):
         home_position: float = 0.0,
         invert_direction: bool = False,
         pulse_delay: float = DEFAULT_PULSE_DELAY,
+        # ── Driver-safety timing ──────────────────────────────────────────
+        # These prevent the physical stepper driver from triggering its
+        # built-in over-speed / direction-reversal fault latch.
+        dir_setup_delay: float = 0.010,
+        # 10 ms between DIR pin change and first step pulse.
+        # Datasheet minimum is typically 5 µs; 10 ms is a large safety margin.
+        post_move_delay: float = 0.050,
+        # 50 ms rest after every move finishes — lets the coil discharge.
+        direction_change_delay: float = 0.200,
+        # 200 ms extra gap when the new move direction is opposite to the last.
+        min_move_interval: float = 0.050,
+        # 50 ms minimum gap between any two consecutive moves (same direction).
     ) -> None:
         super().__init__(cam_id, axis)
         self.step_pin = step_pin
@@ -68,6 +80,11 @@ class GPIODrive(BaseDrive):
         self._home_position = home_position
         self.invert_direction = invert_direction
         self.pulse_delay = pulse_delay
+
+        self.dir_setup_delay = dir_setup_delay
+        self.post_move_delay = post_move_delay
+        self.direction_change_delay = direction_change_delay
+        self.min_move_interval = min_move_interval
 
         self._pul: LED | None = None
         self._dir: LED | None = None
@@ -80,6 +97,10 @@ class GPIODrive(BaseDrive):
         # Prevents two threads from pulsing the same GPIO pin simultaneously.
         self._thread_done = threading.Event()
         self._thread_done.set()  # no thread running initially
+
+        # Inter-move safety state
+        self._last_direction: int | None = None
+        self._last_move_end_ts: float = 0.0
 
     # ── Properties ────────────────────────────────────────────────────────
 
@@ -171,7 +192,9 @@ class GPIODrive(BaseDrive):
                 logger.error("gpio_drive._step_loop: pul is None", key=self.key)
                 return 0
 
-            # Set direction once before pulsing — same as reference script
+            # Set direction once before pulsing — same as reference script.
+            # Sleep dir_setup_delay afterwards so the driver has time to latch
+            # the new direction before the first step pulse arrives.
             forward = direction > 0
             if self.invert_direction:
                 forward = not forward
@@ -180,17 +203,23 @@ class GPIODrive(BaseDrive):
                     dir_dev.on()
                 else:
                     dir_dev.off()
+            _time.sleep(self.dir_setup_delay)
 
             for i in range(steps):
                 if self._stop_flag.is_set():
                     return i
 
                 pul.on()
-                time.sleep(delay)
+                _time.sleep(delay)
                 pul.off()
-                time.sleep(delay)
+                _time.sleep(delay)
 
                 self._current_position = start_pos + (i + 1) * position_per_step
+
+            # Post-move rest — lets the driver coil discharge before the next
+            # command.  Skipped if the stop flag was set (emergency stop).
+            if not self._stop_flag.is_set():
+                _time.sleep(self.post_move_delay)
 
             return steps
 
@@ -239,6 +268,20 @@ class GPIODrive(BaseDrive):
 
             loop = asyncio.get_running_loop()
 
+            # ── Inter-move safety gap ─────────────────────────────────────
+            # Enforce a minimum delay between moves and a longer delay when
+            # the direction reverses, to prevent driver fault-latch.
+            if self._last_direction is not None:
+                needed = (
+                    self.direction_change_delay
+                    if direction != self._last_direction
+                    else self.min_move_interval
+                )
+                elapsed = _time.monotonic() - self._last_move_end_ts
+                gap = needed - elapsed
+                if gap > 0:
+                    await asyncio.sleep(gap)
+
             # Wait for any previous thread to exit before starting a new one.
             # Without this, rapid jogs or cancelled moves leave a ghost thread
             # pulsing the same pin — causing the motor to stall or behave
@@ -277,10 +320,13 @@ class GPIODrive(BaseDrive):
                     steps_done=steps_done,
                     steps_total=steps,
                 )
+                self._last_move_end_ts = _time.monotonic()
                 self._state = DriveState.IDLE
                 return
 
             self._current_position = position
+            self._last_direction = direction
+            self._last_move_end_ts = _time.monotonic()
             self._state = DriveState.REACHED
             logger.info("gpio_drive.move_complete", key=self.key, position=position)
 
