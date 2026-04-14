@@ -26,7 +26,7 @@ Synchronized control system for **2× Luxonis OAK-D 4 Pro** cameras with **4× m
 |---------|---------------|-----------------------------------------|---------|---------|
 | cam1:a  | GPIO linear   | gpiozero step pulse loop (PUL + DIR)    | GPIO 14 | GPIO 15 |
 | cam1:b  | Tinkerforge   | Silent Stepper Bricklet 2.0 via brickd  | UID 2eoB | — |
-| cam2:a  | GPIO linear   | gpiozero step pulse loop (PUL + DIR)    | GPIO 16 | GPIO 17 |
+| cam2:a  | GPIO linear   | gpiozero step pulse loop (PUL + DIR)    | GPIO 15 | GPIO 17 |
 | cam2:b  | Tinkerforge   | Silent Stepper Bricklet 2.0 via brickd  | UID 2eoz | — |
 
 **GPIO motors** use a `time.sleep(0.00001)` pulse loop (10µs HIGH + 10µs LOW) running in a thread via **gpiozero** `LED`. Two pins per motor: PUL (pulse) and DIR (direction). No limit switches yet — calibration is manual via the GUI.
