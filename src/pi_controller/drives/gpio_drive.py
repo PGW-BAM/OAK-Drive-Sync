@@ -26,10 +26,17 @@ logger = structlog.get_logger()
 try:
     from gpiozero import Device, LED
     from gpiozero.exc import GPIOZeroError
-    from gpiozero.pins.lgpio import LGPIOFactory
-    # Pi 5 requires lgpio — set it explicitly so gpiozero doesn't fall back
-    # to RPi.GPIO (which doesn't support Pi 5) and silently go to simulation.
-    Device.pin_factory = LGPIOFactory()
+    # On Pi 5, gpiozero 2.x auto-detects lgpio as the default factory because
+    # RPi.GPIO does not support Pi 5. Forcing LGPIOFactory() explicitly can
+    # crash the import if the GPIO chip is unavailable at import time, causing
+    # all drives to silently fall into simulation mode.
+    # We still try to set lgpio explicitly for clarity, but any failure is
+    # ignored — gpiozero's auto-detection handles it correctly on Pi 5.
+    try:
+        from gpiozero.pins.lgpio import LGPIOFactory
+        Device.pin_factory = LGPIOFactory()
+    except Exception:
+        pass  # gpiozero will auto-select the correct factory for this platform
 except ImportError:
     Device = None  # type: ignore[assignment,misc]
     LED = None  # type: ignore[assignment,misc]
@@ -97,12 +104,14 @@ class GPIODrive(BaseDrive):
             self._simulated = True
             return
 
+        pin_factory = type(Device.pin_factory).__name__ if Device is not None else "unknown"
         logger.info(
             "gpio_drive.setup",
             key=self.key,
             step_pin=self.step_pin,
             dir_pin=self.dir_pin,
             pulse_delay=self.pulse_delay,
+            pin_factory=pin_factory,
         )
 
     async def cleanup(self) -> None:
