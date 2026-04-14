@@ -24,9 +24,14 @@ from src.pi_controller.drives.base import BaseDrive, DriveState
 logger = structlog.get_logger()
 
 try:
-    from gpiozero import LED
+    from gpiozero import Device, LED
     from gpiozero.exc import GPIOZeroError
+    from gpiozero.pins.lgpio import LGPIOFactory
+    # Pi 5 requires lgpio — set it explicitly so gpiozero doesn't fall back
+    # to RPi.GPIO (which doesn't support Pi 5) and silently go to simulation.
+    Device.pin_factory = LGPIOFactory()
 except ImportError:
+    Device = None  # type: ignore[assignment,misc]
     LED = None  # type: ignore[assignment,misc]
     GPIOZeroError = Exception  # type: ignore[assignment,misc]
     logger.warning("gpiozero not available — GPIO drive will run in simulation mode")
@@ -82,8 +87,13 @@ class GPIODrive(BaseDrive):
         try:
             self._pul = LED(self.step_pin)
             self._dir = LED(self.dir_pin)
-        except GPIOZeroError as exc:
-            logger.error("gpio_drive.setup_failed", key=self.key, error=str(exc))
+        except Exception as exc:
+            logger.error(
+                "gpio_drive.setup_failed — falling back to SIMULATION",
+                key=self.key,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
             self._simulated = True
             return
 
@@ -181,7 +191,7 @@ class GPIODrive(BaseDrive):
                 return
 
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 steps_done = await loop.run_in_executor(
                     None, self._step_loop, steps, direction, delta
                 )
