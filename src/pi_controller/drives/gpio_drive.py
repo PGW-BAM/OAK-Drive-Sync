@@ -48,7 +48,7 @@ class GPIODrive(BaseDrive):
         enable_pin: int | None = None,
         steps_per_unit: float = 200.0,
         max_speed: float = 1000.0,
-        max_position: float = 10000.0,
+        max_position: float = 100000.0,
         home_position: float = 0.0,
         invert_direction: bool = False,
         pulse_delay: float = DEFAULT_PULSE_DELAY,

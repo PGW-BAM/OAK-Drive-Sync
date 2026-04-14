@@ -88,8 +88,8 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
     positions: list[PositionPreset] = load_positions()
     sequence_task: asyncio.Task | None = None
 
-    # Apply saved calibration on startup
-    apply_calibration(drive_mgr)
+    # Session-only calibration — no auto-load from file.
+    # All 4 drives must be calibrated manually via the Calibration tab each startup.
 
     # ── Dashboard Tab ──────────────────────────
 
@@ -108,6 +108,18 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
                 ui.link("Calibration", "/calibration").classes("text-white")
                 ui.link("Settings", "/settings").classes("text-white")
 
+        # Calibration banner
+        cal_banner = ui.card().classes("w-full bg-red-100 border-l-4 border-red-500")
+        with cal_banner:
+            with ui.row().classes("items-center gap-2"):
+                ui.icon("warning").classes("text-red-600 text-2xl")
+                cal_banner_text = ui.label(
+                    "Drives not calibrated! Go to the Calibration tab before running sequences."
+                ).classes("text-red-700 font-bold")
+                ui.link("Go to Calibration", "/calibration").classes(
+                    "ml-4 text-red-800 underline font-bold"
+                )
+
         with ui.card().classes("w-full"):
             ui.label("Drive Status").classes("text-lg font-bold")
 
@@ -117,6 +129,9 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
                     with ui.card().classes("w-64") as card:
                         drive_cards[key] = {}
                         ui.label(f"Drive {key}").classes("font-bold text-blue-700")
+                        drive_cards[key]["cal"] = ui.label("NOT CALIBRATED").classes(
+                            "text-red-600 font-bold text-sm"
+                        )
                         drive_cards[key]["state"] = ui.label(f"State: {drive.state.value}")
                         drive_cards[key]["position"] = ui.label(
                             f"Position: {drive.current_position:.1f}"
@@ -135,17 +150,32 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
 
         # Live update timer
         def update_dashboard():
+            all_calibrated = True
             for key, drive in drive_mgr.drives.items():
                 if key in drive_cards:
                     cards = drive_cards[key]
                     cards["state"].text = f"State: {drive.state.value}"
                     cards["position"].text = f"Position: {drive.current_position:.1f}"
-                    min_p = drive.get_min_position()
-                    max_p = drive.get_max_position()
-                    range_size = max_p - min_p
-                    if range_size > 0:
-                        progress = (drive.current_position - min_p) / range_size
-                        cards["progress"].value = max(0.0, min(1.0, progress))
+
+                    if drive.calibrated:
+                        cards["cal"].text = "CALIBRATED"
+                        cards["cal"].classes(replace="text-green-600 font-bold text-sm")
+                        min_p = drive.get_min_position()
+                        max_p = drive.get_max_position()
+                        cards["range"].text = f"Range: {min_p:.0f} – {max_p:.0f}"
+                        range_size = max_p - min_p
+                        if range_size > 0:
+                            progress = (drive.current_position - min_p) / range_size
+                            cards["progress"].value = max(0.0, min(1.0, progress))
+                    else:
+                        all_calibrated = False
+                        cards["cal"].text = "NOT CALIBRATED"
+                        cards["cal"].classes(replace="text-red-600 font-bold text-sm")
+                        cards["range"].text = "Range: — (calibrate first)"
+                        cards["progress"].value = 0
+
+            # Show/hide calibration banner
+            cal_banner.set_visibility(not all_calibrated)
 
             mqtt_label.text = f"MQTT: {'connected' if drive_mgr.mqtt.connected else 'disconnected'}"
             seq_label.text = f"Sequence: {'running' if drive_mgr.sequence_running else 'idle'}"
@@ -372,6 +402,20 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
                 ui.link("Calibration", "/calibration").classes("text-white")
                 ui.link("Settings", "/settings").classes("text-white")
 
+        all_calibrated = all(d.calibrated for d in drive_mgr.drives.values())
+        if not all_calibrated:
+            uncal = [k for k, d in drive_mgr.drives.items() if not d.calibrated]
+            with ui.card().classes("w-full bg-red-100 border-l-4 border-red-500"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("warning").classes("text-red-600 text-2xl")
+                    ui.label(
+                        f"Cannot run sequences — drives not calibrated: {', '.join(uncal)}"
+                    ).classes("text-red-700 font-bold")
+                    ui.link("Go to Calibration", "/calibration").classes(
+                        "ml-4 text-red-800 underline font-bold"
+                    )
+            return
+
         if not positions:
             ui.label(
                 "No positions defined. Go to the Positions tab first."
@@ -488,18 +532,38 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
 
         ui.label("Drive Calibration").classes("text-2xl font-bold")
         ui.markdown(
-            "**How to calibrate:** For each drive, jog it to the physical lower end "
-            "and click **Set as Min**. Then jog to the upper end and click **Set as Max**. "
-            "Use **Set Zero** to define the current position as 0. "
-            "Click **Save Calibration** when done."
+            "**Calibration is required every startup.** For each of the 4 drives:\n\n"
+            "1. Jog to the **lower physical endpoint** → click **Set as Min**\n"
+            "2. Jog to the **upper physical endpoint** → click **Set as Max**\n\n"
+            "All 4 drives must be calibrated before running sequences."
         ).classes("text-gray-600 mb-4")
 
-        cal = load_calibration()
+        # Overall status
+        cal_status = ui.label("").classes("text-lg font-bold mb-2")
+
+        def update_overall_status():
+            done = sum(1 for d in drive_mgr.drives.values() if d.calibrated)
+            total = len(drive_mgr.drives)
+            if done == total:
+                cal_status.text = f"All {total} drives calibrated — ready to go!"
+                cal_status.classes(replace="text-lg font-bold mb-2 text-green-700")
+            else:
+                cal_status.text = f"Calibrated: {done}/{total} drives"
+                cal_status.classes(replace="text-lg font-bold mb-2 text-orange-700")
+
+        update_overall_status()
 
         for key, drive in drive_mgr.drives.items():
             with ui.card().classes("w-full mt-2"):
                 with ui.row().classes("items-center gap-4 w-full"):
                     ui.label(f"Drive {key}").classes("font-bold text-blue-700 text-lg w-24")
+
+                    cal_label = ui.label(
+                        "CALIBRATED" if drive.calibrated else "NOT CALIBRATED"
+                    ).classes(
+                        "font-bold text-sm w-32 " +
+                        ("text-green-600" if drive.calibrated else "text-red-600")
+                    )
 
                     pos_label = ui.label(f"Position: {drive.current_position:.1f}").classes(
                         "w-40"
@@ -507,14 +571,12 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
                     state_label = ui.label(f"({drive.state.value})").classes("w-20")
 
                     min_label = ui.label(
-                        f"Min: {drive.get_min_position():.0f}"
+                        f"Min: {drive.get_min_position():.0f}" if drive.min_calibrated else "Min: —"
                     ).classes("text-orange-700 font-bold w-28")
                     max_label = ui.label(
-                        f"Max: {drive.get_max_position():.0f}"
+                        f"Max: {drive.get_max_position():.0f}" if drive.max_calibrated else "Max: —"
                     ).classes("text-orange-700 font-bold w-28")
-                    range_label = ui.label(
-                        f"Range: {drive.get_max_position() - drive.get_min_position():.0f}"
-                    ).classes("text-purple-700 w-32")
+                    range_label = ui.label("").classes("text-purple-700 w-32")
 
                 # Jog controls
                 with ui.row().classes("items-center gap-2 mt-1"):
@@ -543,39 +605,40 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
 
                 # Calibration actions
                 with ui.row().classes("items-center gap-2 mt-2"):
-                    def set_min(k=key, d=drive, ml=min_label, rl=range_label):
+                    def set_min(
+                        k=key, d=drive, ml=min_label, rl=range_label, cl=cal_label
+                    ):
                         d.set_min_position(d.current_position)
-                        cal[k] = cal.get(k, {})
-                        cal[k]["min"] = d.current_position
+                        d.min_calibrated = True
                         ml.text = f"Min: {d.get_min_position():.0f}"
-                        rl.text = f"Range: {d.get_max_position() - d.get_min_position():.0f}"
-                        ui.notify(
-                            f"{k} MIN set to {d.current_position:.1f}",
-                            type="positive",
-                        )
+                        if d.max_calibrated:
+                            rl.text = f"Range: {d.get_max_position() - d.get_min_position():.0f}"
+                        if d.calibrated:
+                            cl.text = "CALIBRATED"
+                            cl.classes(replace="font-bold text-sm w-32 text-green-600")
+                        update_overall_status()
+                        ui.notify(f"{k} MIN set to {d.current_position:.1f}", type="positive")
 
-                    ui.button("Set as Min", on_click=set_min).props(
-                        "color=deep-orange"
-                    )
+                    ui.button("Set as Min", on_click=set_min).props("color=deep-orange")
 
-                    def set_max(k=key, d=drive, xl=max_label, rl=range_label):
+                    def set_max(
+                        k=key, d=drive, xl=max_label, rl=range_label, cl=cal_label
+                    ):
                         d.set_max_position(d.current_position)
-                        cal[k] = cal.get(k, {})
-                        cal[k]["max"] = d.current_position
+                        d.max_calibrated = True
                         xl.text = f"Max: {d.get_max_position():.0f}"
-                        rl.text = f"Range: {d.get_max_position() - d.get_min_position():.0f}"
-                        ui.notify(
-                            f"{k} MAX set to {d.current_position:.1f}",
-                            type="positive",
-                        )
+                        if d.min_calibrated:
+                            rl.text = f"Range: {d.get_max_position() - d.get_min_position():.0f}"
+                        if d.calibrated:
+                            cl.text = "CALIBRATED"
+                            cl.classes(replace="font-bold text-sm w-32 text-green-600")
+                        update_overall_status()
+                        ui.notify(f"{k} MAX set to {d.current_position:.1f}", type="positive")
 
                     ui.button("Set as Max", on_click=set_max).props("color=deep-orange")
 
                     def set_zero(d=drive, k=key):
                         d.set_zero()
-                        cal[k] = cal.get(k, {})
-                        cal[k]["min"] = d.get_min_position()
-                        cal[k]["max"] = d.get_max_position()
                         ui.notify(f"{k} position reset to 0", type="info")
 
                     ui.button("Set Zero Here", on_click=set_zero).props("color=blue-grey")
@@ -591,42 +654,6 @@ def setup_gui(drive_mgr: DriveManager, config: dict, gui_cfg: dict) -> dict:
                     sl.text = f"({d.state.value})"
 
                 ui.timer(0.2, update_cal_labels)
-
-        ui.separator().classes("mt-4")
-
-        with ui.row().classes("gap-4"):
-            def save_cal():
-                save_calibration(cal)
-                ui.notify("Calibration saved to config/calibration.yaml", type="positive")
-                logger.info("calibration.saved", drives=list(cal.keys()))
-
-            ui.button("Save Calibration", on_click=save_cal).props(
-                "color=green size=lg"
-            ).classes("mt-2")
-
-            def reset_cal():
-                for k, d in drive_mgr.drives.items():
-                    d.set_zero()
-                cal.clear()
-                save_calibration(cal)
-                ui.notify("Calibration reset — all positions set to 0", type="warning")
-
-            ui.button("Reset All", on_click=reset_cal).props(
-                "color=red size=lg flat"
-            ).classes("mt-2")
-
-        # Show saved calibration info
-        with ui.card().classes("w-full mt-4 bg-blue-50"):
-            ui.label("Saved Calibration").classes("font-bold")
-            saved = load_calibration()
-            if saved:
-                for k, limits in saved.items():
-                    ui.label(
-                        f"  {k}: min={limits.get('min', '?')}, max={limits.get('max', '?')}, "
-                        f"range={limits.get('max', 0) - limits.get('min', 0):.0f}"
-                    ).classes("text-sm font-mono")
-            else:
-                ui.label("  No calibration saved yet.").classes("text-gray-500 text-sm")
 
     # ── Settings Tab ───────────────────────────
 

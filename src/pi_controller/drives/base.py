@@ -31,6 +31,8 @@ class BaseDrive(ABC):
         self._target_position: float | None = None
         self._move_lock = asyncio.Lock()
         self.calibration_mode: bool = False
+        self.min_calibrated: bool = False
+        self.max_calibrated: bool = False
 
     @property
     def key(self) -> str:
@@ -47,6 +49,10 @@ class BaseDrive(ABC):
     @property
     def target_position(self) -> float | None:
         return self._target_position
+
+    @property
+    def calibrated(self) -> bool:
+        return self.min_calibrated and self.max_calibrated
 
     @abstractmethod
     async def setup(self) -> None:

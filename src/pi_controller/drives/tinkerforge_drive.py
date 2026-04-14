@@ -36,8 +36,8 @@ class TinkerforgeDrive(BaseDrive):
         uid: str,
         host: str = "localhost",
         port: int = 4223,
-        min_position: int = 1500,
-        max_position: int = 9500,
+        min_position: int = 0,
+        max_position: int = 100000,
         max_velocity: int = 2000,
         acceleration: int = 1000,
         deceleration: int = 1000,
@@ -61,8 +61,8 @@ class TinkerforgeDrive(BaseDrive):
         self._stop_event = asyncio.Event()
         self._simulated = BrickletSilentStepperV2 is None
 
-        # Start at min position (bottom)
-        self._current_position = float(min_position)
+        # Start at 0 — actual position unknown until calibrated
+        self._current_position = 0.0
 
     async def setup(self) -> None:
         if self._simulated:
@@ -86,11 +86,9 @@ class TinkerforgeDrive(BaseDrive):
         self._stepper.set_max_velocity(self.max_velocity)
         self._stepper.set_speed_ramping(self.acceleration, self.deceleration)
 
-        # Sync bricklet's internal position counter with our starting position.
-        # On power-up the bricklet starts at 0, which doesn't match our
-        # min_position. Without this, set_target_position() calculates the
-        # wrong number of steps.
-        self._stepper.set_current_position(self._min_position)
+        # Sync bricklet's internal position counter to 0.
+        # Actual range is unknown until calibrated via GUI.
+        self._stepper.set_current_position(0)
 
         self._stepper.set_enabled(True)
 
@@ -214,11 +212,12 @@ class TinkerforgeDrive(BaseDrive):
         )
 
     async def home(self) -> None:
-        """Home to minimum position."""
+        """Home to minimum position (or 0 if not calibrated)."""
         self._state = DriveState.HOMING
-        logger.info("tinkerforge_drive.homing", key=self.key)
-        await self.move_to(float(self._min_position), speed=0.5)
-        self._current_position = float(self._min_position)
+        home_pos = float(self._min_position) if self.min_calibrated else 0.0
+        logger.info("tinkerforge_drive.homing", key=self.key, target=home_pos)
+        await self.move_to(home_pos, speed=0.5)
+        self._current_position = home_pos
         self._state = DriveState.IDLE
         logger.info("tinkerforge_drive.homed", key=self.key)
 

@@ -1,5 +1,8 @@
 # OAK-Drive-Sync — Drive Hardware Configuration
 # 2x GPIO linear motors + 2x Tinkerforge Silent Stepper Bricklet 2.0
+#
+# NOTE: min/max positions are NOT set here — they are determined by
+# manual calibration via the GUI on each startup (Calibration tab).
 
 broker:
   host: "localhost"
@@ -12,13 +15,9 @@ drives:
   cam1:
     axis_a:                       # GPIO linear motor — single pin control
       type: gpio
-      step_pin: 15                # GPIO 15 — one motor per pin, no dir_pin needed
-      # dir_pin: null             # uncomment and set if your driver has a direction pin
-      # enable_pin: null          # uncomment and set if your driver has an enable pin
+      step_pin: 15                # GPIO 15
       steps_per_unit: 200         # steps per unit of position — adjust for your motor/gearing
       max_speed: 1000             # max steps/second
-      max_position: 10000         # user will configure once hardware range is known
-      home_position: 0            # bottom position (start point)
       invert_direction: false
       pulse_delay: 0.00001        # seconds per half-pulse (0.00001 = 10µs → 20µs/step → 50kHz)
 
@@ -27,22 +26,18 @@ drives:
       uid: "2eoB"                 # Bricklet UID (found via Brick Viewer)
       host: "localhost"           # Brick Daemon host (localhost if USB)
       port: 4223                  # Brick Daemon port
-      min_position: 1500
-      max_position: 9500
       max_velocity: 2000          # steps/second
       acceleration: 1000          # steps/second²
       deceleration: 1000          # steps/second²
       step_resolution: 8          # microstepping (1,2,4,8,16,32,64,128,256)
-      motor_current: 1200         # mA — increase if motor doesn't move (max depends on motor)
+      motor_current: 1200         # mA — increase if motor doesn't move
 
   cam2:
     axis_a:                       # GPIO linear motor — single pin control
       type: gpio
-      step_pin: 17                # GPIO 17 — separate pin from cam1
+      step_pin: 17                # GPIO 17
       steps_per_unit: 200
       max_speed: 1000
-      max_position: 10000
-      home_position: 0
       invert_direction: false
       pulse_delay: 0.00001        # seconds per half-pulse
 
@@ -51,8 +46,6 @@ drives:
       uid: "2eoz"                 # Second bricklet UID
       host: "localhost"
       port: 4223
-      min_position: 1500
-      max_position: 9500
       max_velocity: 2000
       acceleration: 1000
       deceleration: 1000
