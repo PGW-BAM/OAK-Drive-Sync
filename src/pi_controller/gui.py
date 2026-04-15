@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time as _time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -74,12 +75,48 @@ class JogCoalescer:
                 return
             self._pending_delta = 0.0
             target = self._drive.current_position + delta
+
+            # Clamp to calibrated bounds when NOT in calibration mode.
+            # Also drops any residual pending delta that would overshoot,
+            # so repeated "-1000" presses past the floor never pile up.
+            if (
+                getattr(self._drive, "calibrated", False)
+                and not getattr(self._drive, "calibration_mode", False)
+            ):
+                min_p = self._drive.get_min_position()
+                max_p = self._drive.get_max_position()
+                clamped = max(min_p, min(max_p, target))
+                if clamped != target:
+                    self._pending_delta = 0.0
+                target = clamped
+
             try:
                 await self._drive.move_to(target, self._speed)
             except Exception:
                 # Drive fault — drop remaining deltas and stop
                 self._pending_delta = 0.0
                 return
+
+
+# ──────────────────────────────────────────────
+# Per-button click debounce
+# ──────────────────────────────────────────────
+
+# Minimum gap between two presses of the *same* step button (seconds).
+# Paired with JogCoalescer: this stops a flood at the GUI boundary so the
+# coalescer never sees 10 rapid clicks within one frame.
+_CLICK_DEBOUNCE_SEC = 0.1
+_last_click_ts: dict[tuple[str, int], float] = {}
+
+
+def _debounced(key: str, step: int) -> bool:
+    """Return True if this click should be accepted, False if too soon after the last one."""
+    now = _time.monotonic()
+    last = _last_click_ts.get((key, step), 0.0)
+    if now - last < _CLICK_DEBOUNCE_SEC:
+        return False
+    _last_click_ts[(key, step)] = now
+    return True
 
 
 # ──────────────────────────────────────────────
@@ -332,20 +369,81 @@ def setup_gui(
                 ui.link("Calibration", "/calibration").classes("text-white")
                 ui.link("Settings", "/settings").classes("text-white")
 
+        # Entering Manual → always leave calibration mode so clamps apply.
+        for d in drive_mgr.drives.values():
+            d.calibration_mode = False
+
         speed_slider = ui.slider(min=0.1, max=1.0, value=0.5, step=0.1).props(
             "label-always"
         ).classes("w-64")
         ui.label("Speed").classes("text-sm")
 
+        # Button order: biggest-negative → smallest → smallest-positive → biggest.
+        DOWN_STEPS = [1000, 500, 100, 50, 10, 1]
+        UP_STEPS   = [1, 10, 50, 100, 500, 1000]
+
+        # Collect per-drive UI handles so the live-update timer can update them
+        # and toggle button disabled-states without chasing closures.
+        drive_ui: dict[str, dict] = {}
+
         for key, drive in drive_mgr.drives.items():
             with ui.card().classes("w-full mt-2"):
-                ui.label(f"Drive {key}").classes("font-bold text-blue-700")
+                handles: dict = {"drive": drive, "down_buttons": {}, "up_buttons": {}}
 
-                with ui.row().classes("items-center gap-2"):
-                    pos_label = ui.label(f"Position: {drive.current_position:.1f}")
-                    state_label = ui.label(f"({drive.state.value})")
+                with ui.row().classes("items-center gap-4 w-full"):
+                    ui.label(f"Drive {key}").classes(
+                        "font-bold text-blue-700 text-lg w-24"
+                    )
+                    handles["cal"] = ui.label(
+                        "CALIBRATED" if drive.calibrated else "NOT CALIBRATED"
+                    ).classes(
+                        "font-bold text-sm w-32 " +
+                        ("text-green-600" if drive.calibrated else "text-red-600")
+                    )
+                    handles["position"] = ui.label(
+                        f"Position: {drive.current_position:.1f}"
+                    ).classes("w-40")
+                    handles["state"] = ui.label(f"({drive.state.value})").classes("w-24")
+                    handles["min"] = ui.label(
+                        f"Min: {drive.get_min_position():.0f}" if drive.min_calibrated else "Min: —"
+                    ).classes("text-orange-700 font-bold w-28")
+                    handles["max"] = ui.label(
+                        f"Max: {drive.get_max_position():.0f}" if drive.max_calibrated else "Max: —"
+                    ).classes("text-orange-700 font-bold w-28")
 
-                with ui.row().classes("gap-2"):
+                # Progress bar — same visual as Dashboard, only populated once calibrated
+                handles["progress"] = ui.linear_progress(value=0).props("color=blue")
+
+                # Jog step buttons — order: -1000 -500 -100 -50 -10 -1 | +1 +10 +50 +100 +500 +1000
+                with ui.row().classes("items-center gap-1 mt-2"):
+                    ui.label("Jog:").classes("text-sm w-10")
+
+                    for step in DOWN_STEPS:
+                        def jog_down(d=drive, k=key, s=step):
+                            if not _debounced(k, -s):
+                                return
+                            jog_coalescers[k].request(-s, speed_slider.value)
+
+                        btn = ui.button(f"-{step}", on_click=jog_down).props(
+                            "color=teal size=sm dense"
+                        ).classes("px-2")
+                        handles["down_buttons"][step] = btn
+
+                    ui.label("|").classes("text-gray-400")
+
+                    for step in UP_STEPS:
+                        def jog_up(d=drive, k=key, s=step):
+                            if not _debounced(k, +s):
+                                return
+                            jog_coalescers[k].request(+s, speed_slider.value)
+
+                        btn = ui.button(f"+{step}", on_click=jog_up).props(
+                            "color=teal size=sm dense"
+                        ).classes("px-2")
+                        handles["up_buttons"][step] = btn
+
+                # Target / Go / Home / Midpoint / STOP row
+                with ui.row().classes("items-center gap-2 mt-2"):
                     target_input = ui.number(
                         label="Target",
                         value=drive.current_position,
@@ -357,19 +455,32 @@ def setup_gui(
 
                     ui.button("Go", on_click=go_to).props("color=primary")
 
-                    def jog_up(d=drive, k=key, amount=100):
-                        jog_coalescers[k].request(+amount, speed_slider.value)
-
-                    def jog_down(d=drive, k=key, amount=100):
-                        jog_coalescers[k].request(-amount, speed_slider.value)
-
-                    ui.button("+100", on_click=jog_up).props("color=teal")
-                    ui.button("-100", on_click=jog_down).props("color=teal")
-
                     async def home_drive(d=drive):
                         await d.home()
 
                     ui.button("Home", on_click=home_drive).props("color=orange")
+
+                    async def goto_midpoint(d=drive, k=key):
+                        # Radial (Tinkerforge) uses compute_level_position if available
+                        if hasattr(d, "compute_level_position"):
+                            target, source = d.compute_level_position(drift_detector)
+                            if source == "median":
+                                ui.notify(
+                                    f"{k}: no IMU checkpoint — using (min+max)/2",
+                                    type="warning",
+                                )
+                        else:
+                            target = d.get_midpoint_position()
+                        # Require calibration so we have a meaningful midpoint
+                        if not d.calibrated:
+                            ui.notify(
+                                f"{k}: calibrate min and max first",
+                                type="warning",
+                            )
+                            return
+                        await d.move_to(target, speed_slider.value)
+
+                    ui.button("Midpoint", on_click=goto_midpoint).props("color=indigo")
 
                     def stop_drive(d=drive, k=key):
                         jog_coalescers[k].cancel()
@@ -377,11 +488,51 @@ def setup_gui(
 
                     ui.button("STOP", on_click=stop_drive).props("color=red")
 
-                def update_labels(pl=pos_label, sl=state_label, d=drive):
-                    pl.text = f"Position: {d.current_position:.1f}"
-                    sl.text = f"({d.state.value})"
+                drive_ui[key] = handles
 
-                ui.timer(0.3, update_labels)
+        def update_manual():
+            for key, h in drive_ui.items():
+                d = h["drive"]
+                h["position"].text = f"Position: {d.current_position:.1f}"
+                h["state"].text = f"({d.state.value})"
+
+                if d.calibrated:
+                    h["cal"].text = "CALIBRATED"
+                    h["cal"].classes(replace="font-bold text-sm w-32 text-green-600")
+                    min_p = d.get_min_position()
+                    max_p = d.get_max_position()
+                    h["min"].text = f"Min: {min_p:.0f}"
+                    h["max"].text = f"Max: {max_p:.0f}"
+                    range_size = max_p - min_p
+                    if range_size > 0:
+                        progress = (d.current_position - min_p) / range_size
+                        h["progress"].value = max(0.0, min(1.0, progress))
+
+                    # Disable step buttons that would cross a boundary
+                    pos = d.current_position
+                    for step, btn in h["down_buttons"].items():
+                        if pos - step < min_p - 1e-6:
+                            btn.props("disable")
+                        else:
+                            btn.props(remove="disable")
+                    for step, btn in h["up_buttons"].items():
+                        if pos + step > max_p + 1e-6:
+                            btn.props("disable")
+                        else:
+                            btn.props(remove="disable")
+                else:
+                    h["cal"].text = "NOT CALIBRATED"
+                    h["cal"].classes(replace="font-bold text-sm w-32 text-red-600")
+                    h["progress"].value = 0
+                    if not d.min_calibrated:
+                        h["min"].text = "Min: —"
+                    if not d.max_calibrated:
+                        h["max"].text = "Max: —"
+                    # Uncalibrated → leave all buttons enabled (hard-floor in GPIO still protects)
+                    for btn in list(h["down_buttons"].values()) + list(h["up_buttons"].values()):
+                        btn.props(remove="disable")
+
+        ui.timer(0.3, update_manual)
 
         with ui.row().classes("mt-4 gap-2"):
             async def home_all():
@@ -724,13 +875,17 @@ def setup_gui(
                     ).classes("text-orange-700 font-bold w-28")
                     range_label = ui.label("").classes("text-purple-700 w-32")
 
-                # Jog controls
+                # Jog controls — order: -1000 -500 -100 -50 -10 -1 | +1 +10 +50 +100 +500 +1000
                 with ui.row().classes("items-center gap-2 mt-1"):
                     ui.label("Jog:").classes("text-sm w-10")
 
-                    step_sizes = [1, 10, 50, 100, 500, 1000]
-                    for step in step_sizes:
+                    DOWN_STEPS = [1000, 500, 100, 50, 10, 1]
+                    UP_STEPS   = [1, 10, 50, 100, 500, 1000]
+
+                    for step in DOWN_STEPS:
                         def cal_jog_down(d=drive, k=key, s=step):
+                            if not _debounced(k, -s):
+                                return
                             d.calibration_mode = True  # re-assert each press
                             jog_coalescers[k].request(-s, 0.3)
 
@@ -740,8 +895,10 @@ def setup_gui(
 
                     ui.label("|").classes("text-gray-400")
 
-                    for step in step_sizes:
+                    for step in UP_STEPS:
                         def cal_jog_up(d=drive, k=key, s=step):
+                            if not _debounced(k, +s):
+                                return
                             d.calibration_mode = True  # re-assert each press
                             jog_coalescers[k].request(+s, 0.3)
 
@@ -762,6 +919,8 @@ def setup_gui(
                         if d.calibrated:
                             cl.text = "CALIBRATED"
                             cl.classes(replace="font-bold text-sm w-32 text-green-600")
+                            # Calibration complete for this drive → re-enable clamps.
+                            d.calibration_mode = False
                         update_overall_status()
                         _auto_save_calibration(drive_mgr)
                         ui.notify(f"{k} MIN set to {d.current_position:.1f}", type="positive")
@@ -779,6 +938,8 @@ def setup_gui(
                         if d.calibrated:
                             cl.text = "CALIBRATED"
                             cl.classes(replace="font-bold text-sm w-32 text-green-600")
+                            # Calibration complete for this drive → re-enable clamps.
+                            d.calibration_mode = False
                         update_overall_status()
                         _auto_save_calibration(drive_mgr)
                         ui.notify(f"{k} MAX set to {d.current_position:.1f}", type="positive")
@@ -851,6 +1012,9 @@ def setup_gui(
         with ui.row().classes("gap-4 items-center mt-6"):
             def save_cal_click():
                 _auto_save_calibration(drive_mgr)
+                # Leaving calibration → restore clamps on every drive.
+                for d in drive_mgr.drives.values():
+                    d.calibration_mode = False
                 ui.notify("Calibration saved to config/calibration.yaml", type="positive")
             ui.button("Save Calibration", on_click=save_cal_click).props("color=primary size=lg")
             ui.label("Saves all currently-calibrated drives to disk.").classes(

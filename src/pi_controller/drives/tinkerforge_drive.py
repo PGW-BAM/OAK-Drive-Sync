@@ -243,3 +243,45 @@ class TinkerforgeDrive(BaseDrive):
 
     def set_max_position(self, value: float) -> None:
         self._max_position = int(value)
+
+    def compute_level_position(
+        self, drift_detector: object | None = None
+    ) -> tuple[float, str]:
+        """Compute the drive position that puts the camera at roll/pitch = 0°.
+
+        Uses the checkpoint closest to the current position as the anchor:
+          level_pos = cp.drive_position - cp.expected_active_angle_deg * steps_per_degree
+
+        Returns (position, source) where source is one of:
+          - "level"    — computed from an IMU checkpoint
+          - "median"   — fallback (min+max)/2 (no checkpoint or missing config)
+
+        Fallback also triggers if steps_per_degree is zero or checkpoints empty.
+        """
+        median = (self._min_position + self._max_position) / 2.0
+
+        if drift_detector is None:
+            return median, "median"
+
+        # DriftDetector public API: get_checkpoints(cam_id), get_steps_per_degree(cam_id)
+        try:
+            checkpoints = drift_detector.get_checkpoints(self.cam_id)  # type: ignore[attr-defined]
+            spd = drift_detector.get_steps_per_degree(self.cam_id)  # type: ignore[attr-defined]
+        except Exception:
+            return median, "median"
+
+        if not checkpoints or not spd:
+            return median, "median"
+
+        # Pick the checkpoint nearest the current position (most reliable anchor).
+        cp = min(
+            checkpoints,
+            key=lambda c: abs(c["drive_position"] - self._current_position),
+        )
+        active = cp.get("active_angle", "roll")
+        expected = cp.get(f"expected_{active}_deg", 0.0)
+        level_pos = cp["drive_position"] - expected * spd
+
+        # Clamp into calibrated range so we never overshoot endpoints.
+        level_pos = max(self._min_position, min(self._max_position, level_pos))
+        return float(level_pos), "level"

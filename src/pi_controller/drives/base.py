@@ -111,6 +111,14 @@ class BaseDrive(ABC):
         Only call before any movement has occurred."""
         self._current_position = value
 
+    def get_midpoint_position(self) -> float:
+        """Median of min and max — default midpoint for linear drives.
+
+        Overridden by TinkerforgeDrive for radial drives, which compute a
+        camera-level (roll = 0°) midpoint from IMU checkpoints when available.
+        """
+        return (self.get_min_position() + self.get_max_position()) / 2.0
+
     @property
     def is_simulated(self) -> bool:
         """True if the drive is running in software simulation (no real hardware)."""
