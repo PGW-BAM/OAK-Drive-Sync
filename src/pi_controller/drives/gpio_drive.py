@@ -232,8 +232,17 @@ class GPIODrive(BaseDrive):
 
     async def move_to(self, position: float, speed: float = 1.0) -> None:
         async with self._move_lock:
+            # Hard lower-bound — ALWAYS enforced, even in calibration mode.
+            # The iHSS60 drives fault-latch at their physical lowest endpoint
+            # (where gravity deposits them when unpowered).  The startup
+            # position is auto-seeded as the minimum; going below it is not
+            # permitted under any circumstance to keep the drive out of the
+            # fault zone.
+            position = max(self._home_position, position)
+            # Upper bound only clamped outside calibration mode, so the user
+            # can still jog up during calibration to discover the max.
             if not self.calibration_mode:
-                position = max(self._home_position, min(self._max_position, position))
+                position = min(self._max_position, position)
 
             self._target_position = position
             self._state = DriveState.MOVING

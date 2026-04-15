@@ -660,13 +660,15 @@ def setup_gui(
 
         ui.label("Drive Calibration").classes("text-2xl font-bold")
         ui.markdown(
-            "**Before starting the service:** park all drives at their physical lower endpoint.\n\n"
-            "**Min is auto-set from the startup position** — no need to set it manually "
-            "unless the drive was not at the lower endpoint when the service started.\n\n"
+            "**Before starting the service:** park all drives at a safe position "
+            "just above their physical lower endpoint.\n\n"
+            "⚠️ **The startup position becomes a HARD lower bound** — the drive "
+            "will refuse to move below it, even in calibration mode. This prevents "
+            "the iHSS60 drivers from fault-latching at their physical lowest point.\n\n"
             "For each drive:\n"
             "1. Jog to the **upper physical endpoint** → click **Set as Max**\n"
             "2. Click **Save Calibration** when all drives are done\n\n"
-            "Use **Set as Min** to override the auto-seeded minimum if needed."
+            "If you need a lower minimum, restart the service with the drive parked lower."
         ).classes("text-gray-600 mb-4")
 
         # Overall status
