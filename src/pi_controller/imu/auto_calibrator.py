@@ -24,6 +24,7 @@ clamp probes (motor counter may be outside [min,max] after restart drift).
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -69,6 +70,26 @@ async def _read_angle(
     return _pick_angle(imu, active_angle)
 
 
+async def _move_and_settle(
+    drive: TinkerforgeDrive,
+    target: float,
+    *,
+    speed: float,
+    settle_ms: int,
+) -> None:
+    """Move the drive, then wait for the camera body to stop oscillating.
+
+    The Windows-side IMU derives roll/pitch from the accelerometer only — any
+    residual body swing after `position_reached` fires adds vector noise to
+    gravity and produces an unreliable reading. A short settle delay ensures
+    the angle we sample reflects the static post-move orientation, not the
+    transient wobble.
+    """
+    await drive.move_to(target, speed=speed)
+    if settle_ms > 0:
+        await asyncio.sleep(settle_ms / 1000.0)
+
+
 async def auto_calibrate(
     drift_detector: DriftDetector,
     drive: TinkerforgeDrive,
@@ -91,6 +112,11 @@ async def auto_calibrate(
     max_step_per_iter = int(config.get("max_step_per_iter", 1000))
     safety_travel = int(config.get("safety_travel", 8000))
     settle_speed = float(config.get("settle_speed", 0.3))
+    # Delay between `position_reached` and the next IMU sample. Accelerometer-
+    # derived roll is noisy during and immediately after motion; without this
+    # pause we would read a swinging value and fail to detect stuck / end-stop
+    # conditions accurately.
+    settle_ms = int(config.get("imu_settle_ms", 400))
 
     start_pos = drive.current_position
     was_cal_mode = drive.calibration_mode
@@ -143,7 +169,10 @@ async def auto_calibrate(
             probe_offset = probe_dir * probe_steps * mult
             if abs(probe_offset) > safety_travel:
                 continue  # don't probe beyond safety budget
-            await drive.move_to(start_pos + probe_offset, speed=settle_speed)
+            await _move_and_settle(
+                drive, start_pos + probe_offset,
+                speed=settle_speed, settle_ms=settle_ms,
+            )
             iterations += 1
             probe_angle = await _read_angle(
                 drift_detector,
@@ -176,7 +205,10 @@ async def auto_calibrate(
                 break
             # No response yet — return to start_pos and try the next probe
             # (larger magnitude, or reversed direction).
-            await drive.move_to(start_pos, speed=settle_speed)
+            await _move_and_settle(
+                drive, start_pos,
+                speed=settle_speed, settle_ms=settle_ms,
+            )
             iterations += 1
 
         if not probe_found:
@@ -195,7 +227,10 @@ async def auto_calibrate(
                     "axis for this mounting."
                 ),
             )
-            await drive.move_to(start_pos, speed=settle_speed)
+            await _move_and_settle(
+                drive, start_pos,
+                speed=settle_speed, settle_ms=settle_ms,
+            )
             iterations += 1
             return AutoCalResult(
                 cam_id, axis, False, None, None, None, None, iterations,
@@ -215,26 +250,31 @@ async def auto_calibrate(
         )
 
         # Return to start so Phase 2 searches symmetrically.
-        await drive.move_to(start_pos, speed=settle_speed)
+        await _move_and_settle(
+            drive, start_pos,
+            speed=settle_speed, settle_ms=settle_ms,
+        )
         iterations += 1
 
         # ───────────── Phase 2: reference-angle Newton search ─────────────
         # Correction drives (current_angle - reference_angle_deg) toward zero.
-        # Phase 1's direction_sign inference can be wrong if IMU noise or
-        # backlash flips the measured probe delta. Three recovery signals:
-        #   - err-regression: |err| grows after a substantive correction AND the
-        #                     error sign didn't flip. Real wrong-direction move.
-        #                     Flip immediately (one bad step is enough).
-        #   - crossover:      err sign flipped — we stepped past the target. Not
-        #                     a direction problem; est_spd was too high and we
-        #                     overshot. Don't flip; just let the re-estimated
+        # Phase 1's direction_sign inference can be wrong if IMU noise flips
+        # the measured probe delta. Three recovery signals:
+        #   - err-regression: |err| grows after a substantive correction AND
+        #                     the error sign didn't flip. Real wrong-direction
+        #                     move. Flip immediately (one bad step is enough).
+        #   - crossover:      err sign flipped — we stepped past the target.
+        #                     Not a direction problem; est_spd was too high and
+        #                     we overshot. Don't flip; just let the re-estimated
         #                     est_spd shrink the next step.
         #   - angle-stuck:    commanded a meaningful move, IMU didn't respond.
-        #                     Escalate the step size on each retry (1× → 2× → 4×
-        #                     max_step_per_iter) so a larger burst can break
-        #                     through backlash / gravity-driven dead zones.
-        #                     Up to `stuck_limit` stuck retries per direction
-        #                     before flipping direction_sign or aborting.
+        #                     Interpret as "end-stop reached in that motor
+        #                     direction" — DO NOT push further the same way.
+        #                     Back the drive off to start_pos, flip direction,
+        #                     and try from the other side once. If stuck again
+        #                     after the flip, the camera is pinned between two
+        #                     end-stops (or the mechanism is decoupled) — abort
+        #                     with a clear hint instead of wasting more travel.
         #
         # est_spd is re-estimated after every substantive iteration (smoothed)
         # because Phase 1's probe often runs inside backlash and underestimates
@@ -253,12 +293,6 @@ async def auto_calibrate(
         prev_err_sign: int = 0
         prev_delta_steps: int = 0
         flipped_in_phase2 = False
-        consecutive_stuck = 0
-        stuck_limit = 4         # stuck iterations per direction before flip/abort
-        stuck_multiplier = 1    # scales step size on stuck to break through backlash
-        # Cap escalation at 2× so 4 stuck iterations (1×+3×2×=7× max_step_per_iter)
-        # stay inside safety_travel=8000 with max_step_per_iter=1000.
-        stuck_mult_cap = 2
         for _ in range(max_iterations):
             angle = await _read_angle(
                 drift_detector, cam_id, active_angle, "autocal:phase2_search"
@@ -320,7 +354,6 @@ async def auto_calibrate(
             # "substantive" only if it commanded ≥ regression_threshold_deg
             # worth of steps — protects against noise-triggered false alarms
             # on tiny corrections that finished convergence.
-            acted = False
             if (
                 prev_abs_err is not None
                 and abs(prev_delta_steps)
@@ -343,7 +376,6 @@ async def auto_calibrate(
                         old_dir = direction_sign
                         direction_sign = -direction_sign
                         flipped_in_phase2 = True
-                        consecutive_stuck = 0
                         logger.warning(
                             "auto_calibrator.phase2_direction_flip",
                             cam_id=cam_id,
@@ -371,113 +403,99 @@ async def auto_calibrate(
                                 "sign is correct for this cam."
                             ),
                         )
-                        await drive.move_to(start_pos, speed=settle_speed)
+                        await _move_and_settle(
+                            drive, start_pos,
+                            speed=settle_speed, settle_ms=settle_ms,
+                        )
                         iterations += 1
                         return AutoCalResult(
                             cam_id, axis, False, None, None, None, None, iterations,
                             "phase2_both_directions_err_regression",
                         )
-                    acted = True
                 elif angle_stuck:
-                    # Didn't regress but also didn't move meaningfully. Could
-                    # be backlash, gravity-driven dead zone, or an end-stop.
-                    # Escalate step size (1× → 2× → 4× max_step_per_iter) on
-                    # each retry so a subsequent attempt can break through a
-                    # dead zone that smaller moves couldn't.
-                    consecutive_stuck += 1
-                    stuck_multiplier = min(stuck_mult_cap, max(2, stuck_multiplier * 2))
+                    # Commanded a real move, IMU didn't respond → we just
+                    # pushed into a physical end-stop (or the mechanism
+                    # decoupled). Escalating the step size would just grind
+                    # harder into the stop; instead we back off to start_pos
+                    # and try the opposite motor direction once. If stuck
+                    # again after the flip, the camera is pinned between two
+                    # stops (or the mechanism is broken) — abort cleanly.
                     logger.warning(
                         "auto_calibrator.phase2_angle_stuck",
                         cam_id=cam_id,
-                        consecutive_stuck=consecutive_stuck,
-                        stuck_limit=stuck_limit,
-                        stuck_multiplier=stuck_multiplier,
                         flipped_in_phase2=flipped_in_phase2,
                         prev_delta_steps=prev_delta_steps,
                         angle_delta=round(angle_delta, 3),
                         current_abs_err=round(abs(err), 3),
                         current_position=drive.current_position,
                     )
-                    if consecutive_stuck >= stuck_limit:
-                        if not flipped_in_phase2:
-                            old_dir = direction_sign
-                            direction_sign = -direction_sign
-                            flipped_in_phase2 = True
-                            consecutive_stuck = 0
-                            stuck_multiplier = 1
-                            logger.warning(
-                                "auto_calibrator.phase2_direction_flip",
-                                cam_id=cam_id,
-                                reason="angle_stuck_persistent",
-                                old_direction_sign=old_dir,
-                                new_direction_sign=direction_sign,
-                                current_position=drive.current_position,
-                                current_abs_err=round(abs(err), 3),
-                            )
-                        else:
-                            logger.error(
-                                "auto_calibrator.phase2_abort_both_directions_stuck",
-                                cam_id=cam_id,
-                                current_position=drive.current_position,
-                                start_pos=start_pos,
-                                travel_from_start=drive.current_position - start_pos,
-                                current_angle=round(angle, 3),
-                                reference_angle_deg=reference_angle_deg,
-                                current_abs_err=round(abs(err), 3),
-                                hint=(
-                                    "Camera appears pinned against a physical "
-                                    "end-stop in both motor directions. "
-                                    "Manually center the camera near the "
-                                    "reference angle and restart, or relax the "
-                                    "soft envelope so the motor can clear the "
-                                    "stop."
-                                ),
-                            )
-                            await drive.move_to(start_pos, speed=settle_speed)
-                            iterations += 1
-                            return AutoCalResult(
-                                cam_id, axis, False, None, None, None, None, iterations,
-                                "phase2_both_directions_angle_stuck",
-                            )
-                        acted = True
-
-            # Real angle response this iteration — reset the stuck counter
-            # AND the step-size escalation so an isolated backlash blip
-            # doesn't keep forcing oversized moves once the mechanism frees up.
-            if not acted and prev_angle is not None:
-                angle_delta = abs(angle - prev_angle)
-                if angle_delta >= min_response_deg:
-                    if consecutive_stuck > 0 or stuck_multiplier > 1:
-                        logger.info(
-                            "auto_calibrator.phase2_unstuck",
+                    if not flipped_in_phase2:
+                        old_dir = direction_sign
+                        direction_sign = -direction_sign
+                        flipped_in_phase2 = True
+                        logger.warning(
+                            "auto_calibrator.phase2_direction_flip",
                             cam_id=cam_id,
-                            angle_delta=round(angle_delta, 3),
-                            consecutive_stuck_reset_from=consecutive_stuck,
-                            stuck_multiplier_reset_from=stuck_multiplier,
+                            reason="angle_stuck_end_stop",
+                            old_direction_sign=old_dir,
+                            new_direction_sign=direction_sign,
+                            current_position=drive.current_position,
+                            current_abs_err=round(abs(err), 3),
+                            hint=(
+                                "Interpreted as end-stop in the previous "
+                                "motor direction. Backing off to start_pos "
+                                "and trying the opposite direction."
+                            ),
                         )
-                    consecutive_stuck = 0
-                    stuck_multiplier = 1
+                        # Back off from the end-stop before the next attempt.
+                        await _move_and_settle(
+                            drive, start_pos,
+                            speed=settle_speed, settle_ms=settle_ms,
+                        )
+                        iterations += 1
+                        # Reset delta history so the next iteration's
+                        # recovery logic doesn't fire off the pre-flip move.
+                        prev_angle = None
+                        prev_abs_err = None
+                        prev_err_sign = 0
+                        prev_delta_steps = 0
+                        continue
+                    else:
+                        logger.error(
+                            "auto_calibrator.phase2_abort_both_directions_stuck",
+                            cam_id=cam_id,
+                            current_position=drive.current_position,
+                            start_pos=start_pos,
+                            travel_from_start=drive.current_position - start_pos,
+                            current_angle=round(angle, 3),
+                            reference_angle_deg=reference_angle_deg,
+                            current_abs_err=round(abs(err), 3),
+                            hint=(
+                                "Camera appears pinned against a physical "
+                                "end-stop in both motor directions. Manually "
+                                "center the camera near the reference angle "
+                                "and restart, or relax the soft envelope so "
+                                "the motor can clear the stop."
+                            ),
+                        )
+                        await _move_and_settle(
+                            drive, start_pos,
+                            speed=settle_speed, settle_ms=settle_ms,
+                        )
+                        iterations += 1
+                        return AutoCalResult(
+                            cam_id, axis, False, None, None, None, None, iterations,
+                            "phase2_both_directions_angle_stuck",
+                        )
 
             if abs(err) <= ref_threshold_deg:
                 break
 
-            if stuck_multiplier > 1:
-                # Stuck mode: push with a fixed burst in the target direction
-                # rather than a tiny err-scaled step. A small commanded move
-                # after a stuck iteration would almost certainly re-stick —
-                # we need a larger push to break through backlash / gravity.
-                motor_dir = (
-                    -err_sign * direction_sign
-                    if err_sign != 0
-                    else direction_sign
-                )
-                delta_steps = motor_dir * max_step_per_iter * stuck_multiplier
-            else:
-                delta_steps = int(-err * est_spd * direction_sign)
-                if delta_steps > max_step_per_iter:
-                    delta_steps = max_step_per_iter
-                elif delta_steps < -max_step_per_iter:
-                    delta_steps = -max_step_per_iter
+            delta_steps = int(-err * est_spd * direction_sign)
+            if delta_steps > max_step_per_iter:
+                delta_steps = max_step_per_iter
+            elif delta_steps < -max_step_per_iter:
+                delta_steps = -max_step_per_iter
 
             pre_pos = drive.current_position
             next_pos = pre_pos + delta_steps
@@ -498,7 +516,10 @@ async def auto_calibrate(
                     "safety_travel_exceeded",
                 )
 
-            await drive.move_to(next_pos, speed=settle_speed)
+            await _move_and_settle(
+                drive, next_pos,
+                speed=settle_speed, settle_ms=settle_ms,
+            )
             iterations += 1
 
             prev_angle = angle
@@ -521,7 +542,10 @@ async def auto_calibrate(
         )
 
         # ───────────── Phase 3: steps-per-degree measurement ─────────────
-        await drive.move_to(reference_position + measure_steps, speed=settle_speed)
+        await _move_and_settle(
+            drive, reference_position + measure_steps,
+            speed=settle_speed, settle_ms=settle_ms,
+        )
         iterations += 1
         angle_pos = await _read_angle(
             drift_detector, cam_id, active_angle, "autocal:phase3_pos"
@@ -532,7 +556,10 @@ async def auto_calibrate(
                 "imu_timeout",
             )
 
-        await drive.move_to(reference_position - measure_steps, speed=settle_speed)
+        await _move_and_settle(
+            drive, reference_position - measure_steps,
+            speed=settle_speed, settle_ms=settle_ms,
+        )
         iterations += 1
         angle_neg = await _read_angle(
             drift_detector, cam_id, active_angle, "autocal:phase3_neg"
@@ -561,7 +588,10 @@ async def auto_calibrate(
         )
 
         # ───────────── Phase 4: return to origin ─────────────
-        await drive.move_to(start_pos, speed=settle_speed)
+        await _move_and_settle(
+            drive, start_pos,
+            speed=settle_speed, settle_ms=settle_ms,
+        )
         iterations += 1
 
         return AutoCalResult(

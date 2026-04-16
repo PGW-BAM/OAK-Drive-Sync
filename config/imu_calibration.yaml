@@ -59,7 +59,12 @@ auto_calibration:
   max_iterations: 30          # Phase 2 Newton-search budget
   max_step_per_iter: 1000     # per-iteration clamp
   safety_travel: 8000         # abort Phase 2 if drive drifts this far from start
-  settle_speed: 0.3
+  settle_speed: 0.2           # slow: gentler stop → cleaner post-move IMU reading
+  imu_settle_ms: 400          # wait this long after each move before sampling
+                              # the IMU — accelerometer-derived roll swings for
+                              # several hundred ms after the motor stops; a too-
+                              # short delay makes us mis-classify a settling
+                              # reading as "angle_stuck"
 
 # Closed-loop angle convergence (used when Windows sends target_angle_deg).
 # The drive is nudged toward the camera-IMU target angle over multiple iterations
