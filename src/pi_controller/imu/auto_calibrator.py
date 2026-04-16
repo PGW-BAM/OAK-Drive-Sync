@@ -213,25 +213,35 @@ async def auto_calibrate(
         # ───────────── Phase 2: reference-angle Newton search ─────────────
         # Correction drives (current_angle - reference_angle_deg) toward zero.
         # Phase 1's direction_sign inference can be wrong if IMU noise or
-        # backlash flips the measured probe delta. Two recovery signals:
-        #   - err-regression: |err| grows after a substantive correction → wrong
-        #                     sign. Flip immediately (one bad step is enough
-        #                     evidence that we're going the wrong way).
+        # backlash flips the measured probe delta. Three recovery signals:
+        #   - err-regression: |err| grows after a substantive correction AND the
+        #                     error sign didn't flip. Real wrong-direction move.
+        #                     Flip immediately (one bad step is enough).
+        #   - crossover:      err sign flipped — we stepped past the target. Not
+        #                     a direction problem; est_spd was too high and we
+        #                     overshot. Don't flip; just let the re-estimated
+        #                     est_spd shrink the next step.
         #   - angle-stuck:    commanded a meaningful move, IMU didn't respond.
-        #                     Could be backlash, a temporary snag, or a real
-        #                     limit. Require TWO consecutive stuck iterations
-        #                     in the same direction before acting, so backlash
-        #                     gets a chance to break through on retry.
-        # Each direction gets at most one flip; after the flip, another two
-        # consecutive stuck events (or an err-regression) means we're pinned
-        # in both directions and must abort to avoid marching to safety_travel.
+        #                     Could be backlash or a real limit. Require TWO
+        #                     consecutive stuck iterations in the same direction
+        #                     before acting, so backlash gets a chance to break
+        #                     through on retry.
+        #
+        # est_spd is re-estimated after every substantive iteration (smoothed)
+        # because Phase 1's probe often runs inside backlash and underestimates
+        # the true steps-per-degree ratio by several × once real motion starts.
+        # Without this, Newton steps chronically overshoot near the target.
+        #
         # On Tinkerforge, drive.current_position always equals the last
         # commanded target (no stall feedback), so angle is the only reliable
         # signal of physical motion.
         min_response_deg = 0.2
         regression_threshold_deg = max(ref_threshold_deg, motion_threshold_deg)
+        spd_smoothing = 0.5  # 0 = trust new measurement fully, 1 = never update
+        spd_min = 1.0        # clamp so we never divide by ~zero
         prev_angle: float | None = None
         prev_abs_err: float | None = None
+        prev_err_sign: int = 0
         prev_delta_steps: int = 0
         flipped_in_phase2 = False
         consecutive_stuck = 0
@@ -247,6 +257,51 @@ async def auto_calibrate(
                 )
 
             err = angle - reference_angle_deg
+            err_sign = 1 if err > 0 else (-1 if err < 0 else 0)
+
+            # Re-estimate steps-per-degree from the last substantive iteration's
+            # observed response. This is critical when the Phase 1 probe ran
+            # mostly inside backlash: once real motion starts, the true ratio
+            # can be many × smaller, and an over-high est_spd causes repeated
+            # Newton overshoot. Only update from meaningful moves that actually
+            # rotated the camera in the expected motor direction.
+            if (
+                prev_angle is not None
+                and abs(prev_delta_steps)
+                >= max(1, int(est_spd * regression_threshold_deg))
+                and abs(angle - prev_angle) >= min_response_deg
+            ):
+                measured_spd = abs(prev_delta_steps) / abs(angle - prev_angle)
+                measured_spd = max(spd_min, measured_spd)
+                new_spd = spd_smoothing * est_spd + (1.0 - spd_smoothing) * measured_spd
+                if abs(new_spd - est_spd) >= 1.0:
+                    logger.info(
+                        "auto_calibrator.phase2_spd_update",
+                        cam_id=cam_id,
+                        prev_spd=round(est_spd, 3),
+                        measured_spd=round(measured_spd, 3),
+                        new_spd=round(new_spd, 3),
+                        prev_delta_steps=prev_delta_steps,
+                        angle_delta=round(angle - prev_angle, 3),
+                    )
+                est_spd = new_spd
+
+            # Detect an err sign flip (crossover). If prev_err was non-zero and
+            # current err has the opposite sign, we stepped across the target.
+            # That's overshoot, not wrong direction — the spd re-estimate above
+            # will damp the next step naturally. We skip err_regression in that
+            # case so we don't abort near-convergence runs.
+            crossed = (
+                prev_err_sign != 0 and err_sign != 0 and err_sign != prev_err_sign
+            )
+            if crossed:
+                logger.info(
+                    "auto_calibrator.phase2_crossover",
+                    cam_id=cam_id,
+                    prev_abs_err=round(prev_abs_err, 3) if prev_abs_err else None,
+                    current_abs_err=round(abs(err), 3),
+                    prev_delta_steps=prev_delta_steps,
+                )
 
             # Direction-inference recovery checks. The previous iteration is
             # "substantive" only if it commanded ≥ regression_threshold_deg
@@ -259,7 +314,10 @@ async def auto_calibrate(
                 >= max(1, int(est_spd * regression_threshold_deg))
             ):
                 angle_delta = abs(angle - prev_angle) if prev_angle is not None else 0.0
-                err_grew = abs(err) > prev_abs_err + regression_threshold_deg
+                err_grew = (
+                    not crossed
+                    and abs(err) > prev_abs_err + regression_threshold_deg
+                )
                 angle_stuck = angle_delta < min_response_deg
 
                 if err_grew:
@@ -406,6 +464,7 @@ async def auto_calibrate(
 
             prev_angle = angle
             prev_abs_err = abs(err)
+            prev_err_sign = err_sign
             prev_delta_steps = delta_steps
         else:
             return AutoCalResult(
