@@ -490,9 +490,10 @@ def setup_gui(
 
                 # Alternative: converge to a taught IMU angle (radial axis_b only).
                 # User enters a magnitude (abs); sign comes from config so cam2's
-                # flipped mounting is handled transparently.
-                if key.endswith("_b") and drift_detector is not None:
-                    cam_id = key[:-2]  # "cam1_b" → "cam1"
+                # flipped mounting is handled transparently. Drive keys follow
+                # "<cam_id>:<axis>" (e.g. "cam1:b") per DriveBase.key.
+                if key.endswith(":b") and drift_detector is not None:
+                    cam_id = key.split(":", 1)[0]
 
                     with ui.row().classes("items-center gap-2 mt-2"):
                         angle_input = ui.number(
