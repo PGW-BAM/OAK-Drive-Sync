@@ -130,13 +130,43 @@ class DriveManager:
             # Wait settling time
             await asyncio.sleep(self.settling_delay_ms / 1000.0)
 
-            # IMU drift check — axis_b Tinkerforge radial drives only
+            target_angle_deg = payload.get("target_angle_deg")
+            active_angle = payload.get("active_angle")
+            resync_position = payload.get("resync_position")
+
             if (
+                axis == "b"
+                and self.drift_detector is not None
+                and isinstance(drive, TinkerforgeDrive)
+                and target_angle_deg is not None
+                and active_angle in ("roll", "pitch")
+            ):
+                # Closed-loop angle convergence (Windows supplied a target angle).
+                result = await self.drift_detector.converge(
+                    cam_id,
+                    drive,
+                    target_angle_deg=float(target_angle_deg),
+                    active_angle=active_angle,
+                    checkpoint_name=payload.get("checkpoint_name") or "",
+                    resync_position=(
+                        float(resync_position) if resync_position is not None else None
+                    ),
+                )
+                if not result.converged:
+                    drive._state = DriveState.FAULT
+                    logger.warning(
+                        "drive.converge_failed",
+                        key=key,
+                        iterations=result.iterations,
+                        final_error_deg=result.final_error_deg,
+                    )
+            elif (
                 axis == "b"
                 and self.drift_detector is not None
                 and payload.get("checkpoint_name")
                 and isinstance(drive, TinkerforgeDrive)
             ):
+                # Legacy one-shot drift check (no target_angle_deg supplied).
                 await self.drift_detector.check_and_correct(
                     cam_id, drive, payload["checkpoint_name"]
                 )

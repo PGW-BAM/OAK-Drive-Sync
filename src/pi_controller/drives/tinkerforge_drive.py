@@ -244,6 +244,32 @@ class TinkerforgeDrive(BaseDrive):
     def set_max_position(self, value: float) -> None:
         self._max_position = int(value)
 
+    def set_current_position(self, value: float) -> None:
+        """Override: also sync the Tinkerforge bricklet's internal counter."""
+        if self._state not in (DriveState.IDLE, DriveState.REACHED):
+            raise RuntimeError(
+                f"set_current_position refused: drive {self.key} state={self._state}"
+            )
+        int_value = int(value)
+        if self._stepper is not None and not self._simulated:
+            try:
+                self._stepper.set_current_position(int_value)
+            except Exception as exc:
+                logger.error(
+                    "tinkerforge_drive.set_current_position_failed",
+                    key=self.key,
+                    value=int_value,
+                    error=str(exc),
+                )
+                raise
+        self._current_position = float(int_value)
+        self._target_position = float(int_value)
+        logger.info(
+            "tinkerforge_drive.position_resynced",
+            key=self.key,
+            position=int_value,
+        )
+
     def compute_level_position(
         self, drift_detector: object | None = None
     ) -> tuple[float, str]:

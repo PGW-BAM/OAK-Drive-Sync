@@ -12,14 +12,24 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import structlog
 import yaml
 
 from src.shared.models import DriftDetectionEvent, IMUAngle, IMUCheckRequest
 from src.shared.mqtt_topics import CMD_IMU_CHECK, EVENT_DRIFT, topic
+
+
+@dataclass
+class ConvergeResult:
+    converged: bool
+    iterations: int
+    final_error_deg: float
+    resynced_to: float | None
+    event: DriftDetectionEvent | None  # terminal event that was published
 
 if TYPE_CHECKING:
     from src.pi_controller.drives.tinkerforge_drive import TinkerforgeDrive
@@ -232,6 +242,247 @@ class DriftDetector:
             drift_deg=round(drift, 3),
             correction_steps=correction_steps,
             corrected=corrected,
+        )
+        return event
+
+    # ──────────────────────────────────────────────
+    # Closed-loop angle convergence (Windows supplies target_angle_deg)
+    # ──────────────────────────────────────────────
+
+    async def converge(
+        self,
+        cam_id: str,
+        drive: TinkerforgeDrive,
+        target_angle_deg: float,
+        active_angle: Literal["roll", "pitch"],
+        *,
+        checkpoint_name: str = "",
+        resync_position: float | None = None,
+    ) -> ConvergeResult:
+        """Iterative nudge-and-settle until |measured - target| <= threshold.
+
+        After a successful converge, if `resync_position` is supplied the drive's
+        internal position counter is overwritten (no motion) so cumulative nudges
+        don't permanently offset the min/max envelope.
+
+        One DriftDetectionEvent is published on the terminal iteration (either
+        convergence or max-iteration exhaustion). Per-iteration progress goes to
+        structlog only.
+        """
+        conv = self._calibration.get("convergence", {}) or {}
+        max_iterations: int = int(conv.get("max_iterations", 5))
+        threshold_deg: float = float(conv.get("threshold_deg", 0.3))
+        settle_speed: float = float(conv.get("settle_speed", 0.3))
+        sign_map: dict = conv.get("steps_per_degree_sign", {}) or {}
+        sign: int = int(sign_map.get(f"{cam_id}_b", 1))
+
+        steps_per_deg = self.get_steps_per_degree(cam_id)
+        if steps_per_deg == 0.0:
+            logger.error(
+                "drift_detector.converge_no_steps_per_degree",
+                cam_id=cam_id,
+                hint="Set steps_per_degree in config/imu_calibration.yaml",
+            )
+            return ConvergeResult(
+                converged=False,
+                iterations=0,
+                final_error_deg=float("nan"),
+                resynced_to=None,
+                event=None,
+            )
+
+        max_single_correction_steps = int(10.0 * steps_per_deg)
+        last_request_id = ""
+        last_actual = 0.0
+        err = float("nan")
+        total_correction_steps = 0
+
+        for i in range(1, max_iterations + 1):
+            try:
+                imu = await self.request_imu_check(
+                    cam_id,
+                    checkpoint_name or f"converge:{active_angle}",
+                )
+            except TimeoutError as exc:
+                logger.error(
+                    "drift_detector.converge_imu_timeout",
+                    cam_id=cam_id,
+                    iteration=i,
+                    error=str(exc),
+                )
+                event = await self._publish_converge_event(
+                    cam_id=cam_id,
+                    checkpoint_name=checkpoint_name,
+                    request_id=last_request_id,
+                    expected=target_angle_deg,
+                    actual=last_actual,
+                    drift=err,
+                    correction_steps=total_correction_steps,
+                    corrected=False,
+                    iterations=i,
+                    resynced_to=None,
+                )
+                return ConvergeResult(
+                    converged=False,
+                    iterations=i,
+                    final_error_deg=err,
+                    resynced_to=None,
+                    event=event,
+                )
+
+            last_request_id = imu.request_id or ""
+            last_actual = imu.roll_deg if active_angle == "roll" else imu.pitch_deg
+            err = last_actual - target_angle_deg
+
+            logger.info(
+                "drift_detector.converge_iteration",
+                cam_id=cam_id,
+                iteration=i,
+                active_angle=active_angle,
+                target_deg=round(target_angle_deg, 3),
+                actual_deg=round(last_actual, 3),
+                error_deg=round(err, 3),
+                threshold_deg=threshold_deg,
+            )
+
+            if abs(err) <= threshold_deg:
+                resynced: float | None = None
+                if resync_position is not None:
+                    try:
+                        drive.set_current_position(resync_position)
+                        resynced = resync_position
+                    except Exception:
+                        logger.exception(
+                            "drift_detector.converge_resync_failed",
+                            cam_id=cam_id,
+                            resync_position=resync_position,
+                        )
+                event = await self._publish_converge_event(
+                    cam_id=cam_id,
+                    checkpoint_name=checkpoint_name,
+                    request_id=last_request_id,
+                    expected=target_angle_deg,
+                    actual=last_actual,
+                    drift=err,
+                    correction_steps=total_correction_steps,
+                    corrected=True,
+                    iterations=i,
+                    resynced_to=resynced,
+                )
+                return ConvergeResult(
+                    converged=True,
+                    iterations=i,
+                    final_error_deg=err,
+                    resynced_to=resynced,
+                    event=event,
+                )
+
+            # Not converged yet — apply a corrective nudge. Negate err because
+            # drift = actual - target, and we want to move toward target.
+            raw_correction = int(-err * steps_per_deg * sign)
+            correction_steps = max(
+                -max_single_correction_steps,
+                min(max_single_correction_steps, raw_correction),
+            )
+            if abs(raw_correction) > max_single_correction_steps:
+                logger.critical(
+                    "drift_detector.converge_correction_clamped",
+                    cam_id=cam_id,
+                    iteration=i,
+                    raw_correction=raw_correction,
+                    clamped_to=correction_steps,
+                    error_deg=round(err, 3),
+                )
+
+            new_position = drive.current_position + correction_steps
+            try:
+                await drive.move_to(new_position, speed=settle_speed)
+                total_correction_steps += correction_steps
+            except Exception:
+                logger.exception(
+                    "drift_detector.converge_move_failed",
+                    cam_id=cam_id,
+                    iteration=i,
+                    new_position=new_position,
+                )
+                event = await self._publish_converge_event(
+                    cam_id=cam_id,
+                    checkpoint_name=checkpoint_name,
+                    request_id=last_request_id,
+                    expected=target_angle_deg,
+                    actual=last_actual,
+                    drift=err,
+                    correction_steps=total_correction_steps,
+                    corrected=False,
+                    iterations=i,
+                    resynced_to=None,
+                )
+                return ConvergeResult(
+                    converged=False,
+                    iterations=i,
+                    final_error_deg=err,
+                    resynced_to=None,
+                    event=event,
+                )
+
+        # Max iterations exhausted without convergence.
+        event = await self._publish_converge_event(
+            cam_id=cam_id,
+            checkpoint_name=checkpoint_name,
+            request_id=last_request_id,
+            expected=target_angle_deg,
+            actual=last_actual,
+            drift=err,
+            correction_steps=total_correction_steps,
+            corrected=False,
+            iterations=max_iterations,
+            resynced_to=None,
+        )
+        logger.warning(
+            "drift_detector.converge_exhausted",
+            cam_id=cam_id,
+            max_iterations=max_iterations,
+            final_error_deg=round(err, 3),
+        )
+        return ConvergeResult(
+            converged=False,
+            iterations=max_iterations,
+            final_error_deg=err,
+            resynced_to=None,
+            event=event,
+        )
+
+    async def _publish_converge_event(
+        self,
+        *,
+        cam_id: str,
+        checkpoint_name: str,
+        request_id: str,
+        expected: float,
+        actual: float,
+        drift: float,
+        correction_steps: int,
+        corrected: bool,
+        iterations: int,
+        resynced_to: float | None,
+    ) -> DriftDetectionEvent:
+        event = DriftDetectionEvent(
+            request_id=request_id,
+            cam_id=cam_id,
+            drive_axis="b",
+            checkpoint_name=checkpoint_name,
+            expected_angle_deg=expected,
+            actual_angle_deg=actual,
+            drift_deg=drift,
+            correction_steps=correction_steps,
+            corrected=corrected,
+            iterations=iterations,
+            resynced_to=resynced_to,
+        )
+        await self._mqtt.publish(
+            topic(EVENT_DRIFT, cam_id=cam_id, axis="b"),
+            event,
+            qos=1,
         )
         return event
 

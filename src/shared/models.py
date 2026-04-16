@@ -61,6 +61,9 @@ class MoveCommand(BaseModel):
     target_position: float
     speed: float = Field(default=1.0, ge=0.0, le=1.0)
     checkpoint_name: str | None = None  # if set, Pi runs IMU drift check after settling
+    target_angle_deg: float | None = None
+    active_angle: Literal["roll", "pitch"] | None = None
+    resync_position: float | None = None
     timestamp: datetime = Field(default_factory=_now)
 
 
@@ -249,7 +252,14 @@ class IMUCheckRequest(BaseModel):
 
 
 class DriftDetectionEvent(BaseModel):
-    """Published by Pi when drive drift is detected and a correction is attempted."""
+    """Published by Pi when drive drift is detected and a correction is attempted.
+
+    Closed-loop converge() uses this model per iteration: the final event for a move
+    sets `corrected=True` once |drift_deg| <= threshold, or `corrected=False` once
+    `max_iterations` is exhausted. `iterations` counts attempts in the current move.
+    `resynced_to` records the motor-counter value written after a successful converge
+    so cumulative nudges don't permanently offset the drive's min/max envelope.
+    """
     request_id: str
     cam_id: str
     drive_axis: Literal["a", "b"]  # always "b" (Tinkerforge radial drives only)
@@ -258,5 +268,7 @@ class DriftDetectionEvent(BaseModel):
     actual_angle_deg: float
     drift_deg: float    # actual − expected (signed)
     correction_steps: int   # steps applied (signed); 0 if steps_per_degree not configured
-    corrected: bool     # True if move_to correction succeeded
+    corrected: bool     # True once |drift_deg| <= threshold
+    iterations: int = 1
+    resynced_to: float | None = None
     timestamp: datetime = Field(default_factory=_now)

@@ -22,3 +22,17 @@ checkpoints:
 steps_per_degree:
   cam1_b: 120.0   # steps per degree of rotation — calibrate via GUI
   cam2_b: 120.0
+
+# Closed-loop angle convergence (used when Windows sends target_angle_deg).
+# The drive is nudged toward the camera-IMU target angle over multiple iterations
+# until |measured - target| <= threshold_deg or max_iterations is exhausted.
+# On success the drive's internal position counter is overwritten with the
+# resync_position from the MoveCommand so cumulative nudges don't drift the
+# soft min/max envelope.
+convergence:
+  max_iterations: 5
+  threshold_deg: 0.3
+  settle_speed: 0.3
+  steps_per_degree_sign:
+    cam1_b: 1     # flip to -1 if a positive step decreases the IMU angle
+    cam2_b: 1

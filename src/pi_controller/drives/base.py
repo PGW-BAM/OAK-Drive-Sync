@@ -111,6 +111,25 @@ class BaseDrive(ABC):
         Only call before any movement has occurred."""
         self._current_position = value
 
+    def set_current_position(self, value: float) -> None:
+        """Overwrite the internal position counter without physical motion.
+
+        Used by the closed-loop angle-convergence feature to re-anchor the
+        motor's step counter to the teach-time reference after IMU-based
+        corrections — otherwise the accumulated nudges permanently offset
+        the drive's min/max envelope.
+
+        Only safe to call when the drive is IDLE or REACHED. Subclasses that
+        own a hardware counter (e.g. Tinkerforge bricklet) must override this
+        to keep the hardware and software counters in sync.
+        """
+        if self._state not in (DriveState.IDLE, DriveState.REACHED):
+            raise RuntimeError(
+                f"set_current_position refused: drive {self.key} state={self._state}"
+            )
+        self._current_position = value
+        self._target_position = value
+
     def get_midpoint_position(self) -> float:
         """Median of min and max — default midpoint for linear drives.
 
