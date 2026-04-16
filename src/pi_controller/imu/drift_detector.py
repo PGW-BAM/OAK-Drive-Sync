@@ -308,6 +308,11 @@ class DriftDetector:
         min_response_deg = 0.2
         prev_angle: float | None = None
         prev_correction_steps = 0
+        # Err-regression monitoring: if the motor moved (angle changed) but
+        # |err| grew after a substantive correction, our sign is wrong —
+        # we corrected in the direction that made things worse. Flip once
+        # and keep iterating.
+        prev_abs_err: float | None = None
 
         # Bypass the drive's soft min/max envelope while iterating so the
         # closed-loop controller can always move toward the IMU target, even
@@ -406,6 +411,37 @@ class DriftDetector:
                     error_deg=round(err, 3),
                     threshold_deg=threshold_deg,
                 )
+
+                # Err-regression check: if the previous correction was
+                # substantive (≥ threshold_deg worth of steps) AND |err| grew
+                # by more than threshold_deg, we corrected in the wrong
+                # direction. Flip sign once and let the next iteration
+                # re-attempt with the corrected sign.
+                if (
+                    prev_abs_err is not None
+                    and not reversed_due_to_stuck
+                    and abs(prev_correction_steps)
+                    >= max(1, int(steps_per_deg * threshold_deg))
+                    and abs(err) > prev_abs_err + threshold_deg
+                ):
+                    old_sign = sign
+                    sign = -sign
+                    self.set_target_sign(cam_id, sign, axis="b")
+                    reversed_due_to_stuck = True
+                    logger.warning(
+                        "drift_detector.converge_err_regression_reversing",
+                        cam_id=cam_id,
+                        iteration=i,
+                        prev_abs_err=round(prev_abs_err, 3),
+                        current_abs_err=round(abs(err), 3),
+                        prev_correction_steps=prev_correction_steps,
+                        old_sign=old_sign,
+                        new_sign=sign,
+                        hint=(
+                            "Previous correction grew the error — sign was "
+                            "wrong. Flipping direction."
+                        ),
+                    )
 
                 if abs(err) <= threshold_deg:
                     resynced: float | None = None
@@ -521,6 +557,7 @@ class DriftDetector:
                         )
                         prev_angle = last_actual
                         prev_correction_steps = correction_steps
+                        prev_abs_err = abs(err)
                         continue
                     logger.error(
                         "drift_detector.converge_drive_stuck_both_directions",
@@ -557,6 +594,7 @@ class DriftDetector:
 
                 prev_angle = last_actual
                 prev_correction_steps = correction_steps
+                prev_abs_err = abs(err)
 
             # Max iterations exhausted without convergence.
             event = await self._publish_converge_event(
