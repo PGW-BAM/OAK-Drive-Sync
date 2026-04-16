@@ -588,6 +588,14 @@ class DriftDetector:
         self._calibration.setdefault("steps_per_degree", {})[f"{cam_id}_b"] = value
         self._save_calibration()
 
+    def get_target_sign(self, cam_id: str, axis: str = "b") -> int:
+        """Per-camera sign used to turn a user-entered angle magnitude into a
+        signed target for converge(). Mirrors `steps_per_degree_sign` in the
+        convergence block: +1 for right-side-up, -1 for flipped (cam2)."""
+        conv = self._calibration.get("convergence", {}) or {}
+        sign_map: dict = conv.get("steps_per_degree_sign", {}) or {}
+        return int(sign_map.get(f"{cam_id}_{axis}", 1))
+
     # ──────────────────────────────────────────────
     # Internal helpers
     # ──────────────────────────────────────────────

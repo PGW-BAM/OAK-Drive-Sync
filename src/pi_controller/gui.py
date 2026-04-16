@@ -488,6 +488,75 @@ def setup_gui(
 
                     ui.button("STOP", on_click=stop_drive).props("color=red")
 
+                # Alternative: converge to a taught IMU angle (radial axis_b only).
+                # User enters a magnitude (abs); sign comes from config so cam2's
+                # flipped mounting is handled transparently.
+                if key.endswith("_b") and drift_detector is not None:
+                    cam_id = key[:-2]  # "cam1_b" → "cam1"
+
+                    with ui.row().classes("items-center gap-2 mt-2"):
+                        angle_input = ui.number(
+                            label="Target Angle (|°|)",
+                            value=0.0,
+                            format="%.2f",
+                            min=0.0,
+                            max=180.0,
+                        ).classes("w-40")
+
+                        async def go_to_angle(d=drive, k=key, cam=cam_id, inp=angle_input):
+                            try:
+                                magnitude = float(inp.value or 0.0)
+                            except (TypeError, ValueError):
+                                ui.notify(f"{k}: invalid angle", type="negative")
+                                return
+                            if magnitude <= 0.0:
+                                ui.notify(
+                                    f"{k}: enter a positive magnitude",
+                                    type="warning",
+                                )
+                                return
+                            target_sign = drift_detector.get_target_sign(cam)
+                            signed_target = magnitude * target_sign
+                            ui.notify(
+                                f"{k}: converging to {signed_target:+.2f}° "
+                                f"(|{magnitude:.2f}|, sign={target_sign:+d})",
+                            )
+                            try:
+                                result = await drift_detector.converge(
+                                    cam,
+                                    d,
+                                    target_angle_deg=signed_target,
+                                    active_angle="roll",
+                                    checkpoint_name="manual_angle",
+                                    resync_position=None,
+                                )
+                            except Exception as exc:
+                                logger.exception(
+                                    "gui.manual_angle_converge_failed",
+                                    cam_id=cam,
+                                    magnitude=magnitude,
+                                )
+                                ui.notify(
+                                    f"{k}: converge error — {exc}",
+                                    type="negative",
+                                )
+                                return
+                            if result.converged:
+                                ui.notify(
+                                    f"{k}: converged in {result.iterations} iter "
+                                    f"(err {result.final_error_deg:+.2f}°)",
+                                    type="positive",
+                                )
+                            else:
+                                ui.notify(
+                                    f"{k}: did NOT converge after "
+                                    f"{result.iterations} iter "
+                                    f"(err {result.final_error_deg:+.2f}°)",
+                                    type="negative",
+                                )
+
+                        ui.button("Go (°)", on_click=go_to_angle).props("color=teal")
+
                 drive_ui[key] = handles
 
         def update_manual():
