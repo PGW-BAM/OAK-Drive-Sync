@@ -244,6 +244,36 @@ class TinkerforgeDrive(BaseDrive):
     def set_max_position(self, value: float) -> None:
         self._max_position = int(value)
 
+    def seed_position(self, value: float) -> None:
+        """Pre-seed Python counter AND bricklet counter from the persisted log.
+
+        TinkerforgeDrive.setup() zeroes the bricklet's internal counter on every
+        boot, so without syncing here, Python would report X (the logged value)
+        while the bricklet internally reports 0. The first auto-cal move would
+        then be absolute-against-bricklet-zero, not relative-to-X — e.g. for
+        cam2 with a -1840 seed, the very first probe (start_pos - 400 = -2240)
+        would grind the motor 2240 steps in the negative direction instead of
+        400, typically pinning it against the mechanical minimum stop so no
+        further probe produces any angle response. Syncing here ensures every
+        drive.move_to() issued from auto_calibrator represents a real delta.
+        """
+        super().seed_position(value)
+        if self._stepper is not None and not self._simulated:
+            try:
+                self._stepper.set_current_position(int(value))
+                logger.info(
+                    "tinkerforge_drive.seed_position_synced",
+                    key=self.key,
+                    position=int(value),
+                )
+            except Exception as exc:
+                logger.error(
+                    "tinkerforge_drive.seed_position_sync_failed",
+                    key=self.key,
+                    value=int(value),
+                    error=str(exc),
+                )
+
     def set_current_position(self, value: float) -> None:
         """Override: also sync the Tinkerforge bricklet's internal counter."""
         if self._state not in (DriveState.IDLE, DriveState.REACHED):
