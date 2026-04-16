@@ -208,9 +208,21 @@ async def auto_calibrate(
 
         # ───────────── Phase 2: reference-angle Newton search ─────────────
         # Correction drives (current_angle - reference_angle_deg) toward zero.
-        # Bail out if the motor stops advancing — that means we've hit a
-        # physical end-stop and further commands just pound the mechanism.
-        phase2_stuck_threshold = max(1, int(est_spd * 0.1))
+        # Phase 1's direction_sign inference can be wrong if IMU noise or
+        # backlash flips the measured probe delta. Two recovery signals:
+        #   - err-regression: |err| grows after a substantive correction → wrong sign
+        #   - angle-stuck:    commanded a meaningful move, IMU didn't respond → at limit
+        # Either flips direction_sign once (flipped_in_phase2 guard) and
+        # continues. On Tinkerforge, drive.current_position always equals the
+        # last commanded target (no stall feedback), so position-based
+        # advancement checks are dead on this hardware — angle is the only
+        # reliable signal.
+        min_response_deg = 0.2
+        regression_threshold_deg = max(ref_threshold_deg, motion_threshold_deg)
+        prev_angle: float | None = None
+        prev_abs_err: float | None = None
+        prev_delta_steps: int = 0
+        flipped_in_phase2 = False
         for _ in range(max_iterations):
             angle = await _read_angle(
                 drift_detector, cam_id, active_angle, "autocal:phase2_search"
@@ -222,6 +234,36 @@ async def auto_calibrate(
                 )
 
             err = angle - reference_angle_deg
+
+            # Direction-inference recovery checks. Fire at most once per
+            # Phase 2. Only consider the previous iteration "substantive" if
+            # it was ≥ regression_threshold_deg worth of steps — protects
+            # against noise-triggered flips on tiny corrections.
+            if (
+                prev_abs_err is not None
+                and not flipped_in_phase2
+                and abs(prev_delta_steps)
+                >= max(1, int(est_spd * regression_threshold_deg))
+            ):
+                angle_delta = abs(angle - prev_angle) if prev_angle is not None else 0.0
+                err_grew = abs(err) > prev_abs_err + regression_threshold_deg
+                angle_stuck = angle_delta < min_response_deg
+                if err_grew or angle_stuck:
+                    old_dir = direction_sign
+                    direction_sign = -direction_sign
+                    flipped_in_phase2 = True
+                    logger.warning(
+                        "auto_calibrator.phase2_direction_flip",
+                        cam_id=cam_id,
+                        reason="err_regression" if err_grew else "angle_stuck",
+                        prev_abs_err=round(prev_abs_err, 3),
+                        current_abs_err=round(abs(err), 3),
+                        prev_delta_steps=prev_delta_steps,
+                        angle_delta=round(angle_delta, 3),
+                        old_direction_sign=old_dir,
+                        new_direction_sign=direction_sign,
+                    )
+
             if abs(err) <= ref_threshold_deg:
                 break
 
@@ -241,20 +283,10 @@ async def auto_calibrate(
 
             await drive.move_to(next_pos, speed=settle_speed)
             iterations += 1
-            advancement = drive.current_position - pre_pos
-            if abs(delta_steps) > phase2_stuck_threshold and abs(advancement) < phase2_stuck_threshold:
-                logger.warning(
-                    "auto_calibrator.phase2_drive_stuck",
-                    cam_id=cam_id,
-                    commanded=delta_steps,
-                    advanced=advancement,
-                    angle=round(angle, 3),
-                    reference_angle_deg=reference_angle_deg,
-                )
-                return AutoCalResult(
-                    cam_id, axis, False, None, None, None, None, iterations,
-                    "phase2_drive_stuck",
-                )
+
+            prev_angle = angle
+            prev_abs_err = abs(err)
+            prev_delta_steps = delta_steps
         else:
             return AutoCalResult(
                 cam_id, axis, False, None, None, None, None, iterations,
