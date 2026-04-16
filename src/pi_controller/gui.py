@@ -873,23 +873,32 @@ def setup_gui(
                 ui.link("Calibration", "/calibration").classes("text-white")
                 ui.link("Settings", "/settings").classes("text-white")
 
-        # Enable calibration mode (bypasses position clamping).
-        # Set here for the initial state and also inside each jog handler,
-        # because app.on_disconnect fires on tab navigation and would reset it.
+        # Enable calibration mode (bypasses position clamping) and clear any
+        # previously-saved min/max flags so the old envelope does not bite
+        # while re-teaching. The stored _min_position / _max_position stay
+        # in place and are overwritten when the operator clicks Set as Min /
+        # Set as Max. Re-asserted inside each jog handler too, because
+        # app.on_disconnect fires on tab navigation.
         for d in drive_mgr.drives.values():
             d.calibration_mode = True
+            d.min_calibrated = False
+            d.max_calibrated = False
 
         ui.label("Drive Calibration").classes("text-2xl font-bold")
         ui.markdown(
-            "**Before starting the service:** park all drives at a safe position "
-            "just above their physical lower endpoint.\n\n"
-            "⚠️ **The startup position becomes a HARD lower bound** — the drive "
-            "will refuse to move below it, even in calibration mode. This prevents "
-            "the iHSS60 drivers from fault-latching at their physical lowest point.\n\n"
+            "**Before starting the service:** park each linear drive (axis-a) "
+            "at a safe position just above its physical lower endpoint.\n\n"
+            "⚠️ **Linear drives only (axis-a)**: the startup position becomes a "
+            "HARD lower bound — the iHSS60 drivers fault-latch at the physical "
+            "lowest point, so axis-a refuses to jog below its startup even in "
+            "calibration mode. If a lower minimum is needed, restart the service "
+            "with the drive parked lower.\n\n"
+            "**Radial drives (axis-b)** can be jogged freely in both directions "
+            "here — the previous min/max do not restrict movement on this page.\n\n"
             "For each drive:\n"
-            "1. Jog to the **upper physical endpoint** → click **Set as Max**\n"
-            "2. Click **Save Calibration** when all drives are done\n\n"
-            "If you need a lower minimum, restart the service with the drive parked lower."
+            "1. Jog to the **lower endpoint** → click **Set as Min**\n"
+            "2. Jog to the **upper endpoint** → click **Set as Max**\n"
+            "3. Click **Save Calibration** when all drives are done"
         ).classes("text-gray-600 mb-4")
 
         # Overall status
@@ -989,8 +998,10 @@ def setup_gui(
                         if d.calibrated:
                             cl.text = "CALIBRATED"
                             cl.classes(replace="font-bold text-sm w-32 text-green-600")
-                            # Calibration complete for this drive → re-enable clamps.
-                            d.calibration_mode = False
+                        # calibration_mode stays True until the operator clicks
+                        # Save Calibration — otherwise setting one endpoint
+                        # would immediately re-clamp subsequent jogs and block
+                        # re-teaching the other endpoint.
                         update_overall_status()
                         _auto_save_calibration(drive_mgr)
                         ui.notify(f"{k} MIN set to {d.current_position:.1f}", type="positive")
@@ -1008,8 +1019,8 @@ def setup_gui(
                         if d.calibrated:
                             cl.text = "CALIBRATED"
                             cl.classes(replace="font-bold text-sm w-32 text-green-600")
-                            # Calibration complete for this drive → re-enable clamps.
-                            d.calibration_mode = False
+                        # calibration_mode stays True until Save Calibration —
+                        # see set_min comment above.
                         update_overall_status()
                         _auto_save_calibration(drive_mgr)
                         ui.notify(f"{k} MAX set to {d.current_position:.1f}", type="positive")

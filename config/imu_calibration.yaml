@@ -30,7 +30,8 @@ steps_per_degree:
 # resync_position from the MoveCommand so cumulative nudges don't drift the
 # soft min/max envelope.
 convergence:
-  max_iterations: 5
+  max_iterations: 20              # bounded iteration budget per converge call
+  max_correction_deg: 20.0        # per-iteration travel cap, in degrees
   threshold_deg: 0.3
   settle_speed: 0.3
   steps_per_degree_sign:

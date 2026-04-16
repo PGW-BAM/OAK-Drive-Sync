@@ -124,24 +124,25 @@ class DriveManager:
         # Publish moving state
         await self._publish_position(drive, sequence_id)
 
+        target_angle_deg = payload.get("target_angle_deg")
+        active_angle = payload.get("active_angle")
+        resync_position = payload.get("resync_position")
+
+        angle_driven = (
+            axis == "b"
+            and self.drift_detector is not None
+            and isinstance(drive, TinkerforgeDrive)
+            and target_angle_deg is not None
+            and active_angle in ("roll", "pitch")
+        )
+
         try:
-            await drive.move_to(target, speed)
-
-            # Wait settling time
-            await asyncio.sleep(self.settling_delay_ms / 1000.0)
-
-            target_angle_deg = payload.get("target_angle_deg")
-            active_angle = payload.get("active_angle")
-            resync_position = payload.get("resync_position")
-
-            if (
-                axis == "b"
-                and self.drift_detector is not None
-                and isinstance(drive, TinkerforgeDrive)
-                and target_angle_deg is not None
-                and active_angle in ("roll", "pitch")
-            ):
-                # Closed-loop angle convergence (Windows supplied a target angle).
+            if angle_driven:
+                # Angle-first: skip the coarse motor-step move and let converge
+                # drive the axis from its current physical angle. The motor
+                # counter is unreliable after restarts, so coarse_move against
+                # target_position is not used here; resync_position re-anchors
+                # the counter after successful convergence.
                 result = await self.drift_detector.converge(
                     cam_id,
                     drive,
@@ -160,16 +161,22 @@ class DriveManager:
                         iterations=result.iterations,
                         final_error_deg=result.final_error_deg,
                     )
-            elif (
-                axis == "b"
-                and self.drift_detector is not None
-                and payload.get("checkpoint_name")
-                and isinstance(drive, TinkerforgeDrive)
-            ):
-                # Legacy one-shot drift check (no target_angle_deg supplied).
-                await self.drift_detector.check_and_correct(
-                    cam_id, drive, payload["checkpoint_name"]
-                )
+            else:
+                await drive.move_to(target, speed)
+
+                # Wait settling time
+                await asyncio.sleep(self.settling_delay_ms / 1000.0)
+
+                if (
+                    axis == "b"
+                    and self.drift_detector is not None
+                    and payload.get("checkpoint_name")
+                    and isinstance(drive, TinkerforgeDrive)
+                ):
+                    # Legacy one-shot drift check (no target_angle_deg supplied).
+                    await self.drift_detector.check_and_correct(
+                        cam_id, drive, payload["checkpoint_name"]
+                    )
 
             # Publish reached state
             await self._publish_position(drive, sequence_id)
