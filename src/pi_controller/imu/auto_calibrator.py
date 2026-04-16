@@ -118,7 +118,20 @@ async def auto_calibrate(
         )
 
         # ───────────── Phase 1: direction probe ─────────────
-        await drive.move_to(start_pos + probe_steps, speed=settle_speed)
+        # Probe toward the target reference angle so the first commanded
+        # move never drives the camera AWAY from where we need to go (and
+        # in particular never pushes a motor that's already near a
+        # physical end-stop deeper into it). We guess direction_sign=+1
+        # and pick a step direction that — under that guess — reduces the
+        # angle error. If the guess is wrong, we detect it from the
+        # measured delta and flip direction_sign. If the motor can't move
+        # in the first chosen direction (stuck at a physical limit), we
+        # reverse and retry before giving up.
+        stuck_pos_threshold = max(1, probe_steps // 10)
+
+        probe_dir = 1 if reference_angle_deg > start_angle else -1
+        probe_offset = probe_dir * probe_steps
+        await drive.move_to(start_pos + probe_offset, speed=settle_speed)
         iterations += 1
         probe_angle = await _read_angle(
             drift_detector, cam_id, active_angle, "autocal:phase1_probe"
@@ -127,20 +140,57 @@ async def auto_calibrate(
             return AutoCalResult(
                 cam_id, axis, False, None, None, None, None, iterations, "imu_timeout"
             )
-
-        delta = probe_angle - start_angle
+        delta_pos = drive.current_position - start_pos
+        delta_angle = probe_angle - start_angle
         logger.info(
             "auto_calibrator.phase1_probe",
             cam_id=cam_id,
             start_angle=round(start_angle, 3),
             probe_angle=round(probe_angle, 3),
-            delta_deg=round(delta, 3),
-            probe_steps=probe_steps,
+            delta_deg=round(delta_angle, 3),
+            delta_pos=delta_pos,
+            probe_offset=probe_offset,
         )
 
-        if abs(delta) < motion_threshold_deg:
-            # Motor moved but camera angle didn't — stuck, uncoupled, or
-            # probe too small. Abort so operator can investigate.
+        # Motor didn't advance — probably at a physical end-stop in this
+        # direction. Return to start and probe the other way.
+        if abs(delta_pos) < stuck_pos_threshold:
+            logger.warning(
+                "auto_calibrator.phase1_stuck_retry_reverse",
+                cam_id=cam_id,
+                delta_pos=delta_pos,
+            )
+            await drive.move_to(start_pos, speed=settle_speed)
+            iterations += 1
+            probe_dir = -probe_dir
+            probe_offset = probe_dir * probe_steps
+            await drive.move_to(start_pos + probe_offset, speed=settle_speed)
+            iterations += 1
+            probe_angle = await _read_angle(
+                drift_detector, cam_id, active_angle, "autocal:phase1_probe_reverse"
+            )
+            if probe_angle is None:
+                return AutoCalResult(
+                    cam_id, axis, False, None, None, None, None, iterations, "imu_timeout"
+                )
+            delta_pos = drive.current_position - start_pos
+            delta_angle = probe_angle - start_angle
+            logger.info(
+                "auto_calibrator.phase1_probe_reverse",
+                cam_id=cam_id,
+                probe_angle=round(probe_angle, 3),
+                delta_deg=round(delta_angle, 3),
+                delta_pos=delta_pos,
+            )
+            if abs(delta_pos) < stuck_pos_threshold:
+                return AutoCalResult(
+                    cam_id, axis, False, None, None, None, None, iterations,
+                    "drive_stuck_both_directions",
+                )
+
+        if abs(delta_angle) < motion_threshold_deg:
+            # Motor moved but camera angle didn't — uncoupled, or probe
+            # too small. Abort so operator can investigate.
             await drive.move_to(start_pos, speed=settle_speed)
             iterations += 1
             return AutoCalResult(
@@ -148,8 +198,9 @@ async def auto_calibrate(
                 "probe_no_motion",
             )
 
-        direction_sign = 1 if delta > 0 else -1
-        est_spd = probe_steps / abs(delta)
+        # direction_sign = +1 iff positive motor steps produce positive angle delta.
+        direction_sign = 1 if (delta_angle * delta_pos) > 0 else -1
+        est_spd = abs(delta_pos) / abs(delta_angle)
 
         # Return to start so Phase 2 searches symmetrically.
         await drive.move_to(start_pos, speed=settle_speed)
@@ -157,6 +208,9 @@ async def auto_calibrate(
 
         # ───────────── Phase 2: reference-angle Newton search ─────────────
         # Correction drives (current_angle - reference_angle_deg) toward zero.
+        # Bail out if the motor stops advancing — that means we've hit a
+        # physical end-stop and further commands just pound the mechanism.
+        phase2_stuck_threshold = max(1, int(est_spd * 0.1))
         for _ in range(max_iterations):
             angle = await _read_angle(
                 drift_detector, cam_id, active_angle, "autocal:phase2_search"
@@ -177,7 +231,8 @@ async def auto_calibrate(
             elif delta_steps < -max_step_per_iter:
                 delta_steps = -max_step_per_iter
 
-            next_pos = drive.current_position + delta_steps
+            pre_pos = drive.current_position
+            next_pos = pre_pos + delta_steps
             if abs(next_pos - start_pos) > safety_travel:
                 return AutoCalResult(
                     cam_id, axis, False, None, None, None, None, iterations,
@@ -186,6 +241,20 @@ async def auto_calibrate(
 
             await drive.move_to(next_pos, speed=settle_speed)
             iterations += 1
+            advancement = drive.current_position - pre_pos
+            if abs(delta_steps) > phase2_stuck_threshold and abs(advancement) < phase2_stuck_threshold:
+                logger.warning(
+                    "auto_calibrator.phase2_drive_stuck",
+                    cam_id=cam_id,
+                    commanded=delta_steps,
+                    advanced=advancement,
+                    angle=round(angle, 3),
+                    reference_angle_deg=reference_angle_deg,
+                )
+                return AutoCalResult(
+                    cam_id, axis, False, None, None, None, None, iterations,
+                    "phase2_drive_stuck",
+                )
         else:
             return AutoCalResult(
                 cam_id, axis, False, None, None, None, None, iterations,
