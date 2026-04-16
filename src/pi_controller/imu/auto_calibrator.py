@@ -214,19 +214,28 @@ async def auto_calibrate(
         # Correction drives (current_angle - reference_angle_deg) toward zero.
         # Phase 1's direction_sign inference can be wrong if IMU noise or
         # backlash flips the measured probe delta. Two recovery signals:
-        #   - err-regression: |err| grows after a substantive correction → wrong sign
-        #   - angle-stuck:    commanded a meaningful move, IMU didn't respond → at limit
-        # Either flips direction_sign once (flipped_in_phase2 guard) and
-        # continues. On Tinkerforge, drive.current_position always equals the
-        # last commanded target (no stall feedback), so position-based
-        # advancement checks are dead on this hardware — angle is the only
-        # reliable signal.
+        #   - err-regression: |err| grows after a substantive correction → wrong
+        #                     sign. Flip immediately (one bad step is enough
+        #                     evidence that we're going the wrong way).
+        #   - angle-stuck:    commanded a meaningful move, IMU didn't respond.
+        #                     Could be backlash, a temporary snag, or a real
+        #                     limit. Require TWO consecutive stuck iterations
+        #                     in the same direction before acting, so backlash
+        #                     gets a chance to break through on retry.
+        # Each direction gets at most one flip; after the flip, another two
+        # consecutive stuck events (or an err-regression) means we're pinned
+        # in both directions and must abort to avoid marching to safety_travel.
+        # On Tinkerforge, drive.current_position always equals the last
+        # commanded target (no stall feedback), so angle is the only reliable
+        # signal of physical motion.
         min_response_deg = 0.2
         regression_threshold_deg = max(ref_threshold_deg, motion_threshold_deg)
         prev_angle: float | None = None
         prev_abs_err: float | None = None
         prev_delta_steps: int = 0
         flipped_in_phase2 = False
+        consecutive_stuck = 0
+        stuck_limit = 2  # need this many consecutive stuck iterations to act
         for _ in range(max_iterations):
             angle = await _read_angle(
                 drift_detector, cam_id, active_angle, "autocal:phase2_search"
@@ -241,12 +250,9 @@ async def auto_calibrate(
 
             # Direction-inference recovery checks. The previous iteration is
             # "substantive" only if it commanded ≥ regression_threshold_deg
-            # worth of steps — protects against noise-triggered flips on tiny
-            # corrections. On the first failure, flip direction_sign and let
-            # the next iteration retry. On a SECOND failure (still stuck
-            # after flipping, or err still growing), abort cleanly instead of
-            # continuing to march toward safety_travel — the drive is
-            # genuinely unable to reach the reference angle from here.
+            # worth of steps — protects against noise-triggered false alarms
+            # on tiny corrections that finished convergence.
+            acted = False
             if (
                 prev_abs_err is not None
                 and abs(prev_delta_steps)
@@ -255,16 +261,22 @@ async def auto_calibrate(
                 angle_delta = abs(angle - prev_angle) if prev_angle is not None else 0.0
                 err_grew = abs(err) > prev_abs_err + regression_threshold_deg
                 angle_stuck = angle_delta < min_response_deg
-                if err_grew or angle_stuck:
-                    reason = "err_regression" if err_grew else "angle_stuck"
+
+                if err_grew:
+                    # |err| grew after a real correction → direction is wrong.
+                    # Don't wait — flip on the first occurrence. This is
+                    # qualitatively different from "stuck" (which might just be
+                    # backlash): here we actually moved, and it made things
+                    # worse.
                     if not flipped_in_phase2:
                         old_dir = direction_sign
                         direction_sign = -direction_sign
                         flipped_in_phase2 = True
+                        consecutive_stuck = 0
                         logger.warning(
                             "auto_calibrator.phase2_direction_flip",
                             cam_id=cam_id,
-                            reason=reason,
+                            reason="err_regression",
                             prev_abs_err=round(prev_abs_err, 3),
                             current_abs_err=round(abs(err), 3),
                             prev_delta_steps=prev_delta_steps,
@@ -273,22 +285,93 @@ async def auto_calibrate(
                             new_direction_sign=direction_sign,
                         )
                     else:
-                        logger.warning(
-                            "auto_calibrator.phase2_both_directions_stuck",
+                        logger.error(
+                            "auto_calibrator.phase2_abort_err_regression_after_flip",
                             cam_id=cam_id,
-                            reason=reason,
-                            prev_abs_err=round(prev_abs_err, 3),
-                            current_abs_err=round(abs(err), 3),
-                            prev_delta_steps=prev_delta_steps,
-                            angle_delta=round(angle_delta, 3),
                             current_position=drive.current_position,
+                            start_pos=start_pos,
+                            current_angle=round(angle, 3),
+                            reference_angle_deg=reference_angle_deg,
+                            current_abs_err=round(abs(err), 3),
+                            hint=(
+                                "Both directions regress — IMU axis mismatch "
+                                "or camera mounting inverted. Verify active_angle "
+                                "config matches mounting and reference_angle_deg "
+                                "sign is correct for this cam."
+                            ),
                         )
                         await drive.move_to(start_pos, speed=settle_speed)
                         iterations += 1
                         return AutoCalResult(
                             cam_id, axis, False, None, None, None, None, iterations,
-                            f"phase2_both_directions_{reason}",
+                            "phase2_both_directions_err_regression",
                         )
+                    acted = True
+                elif angle_stuck:
+                    # Didn't regress but also didn't move meaningfully. Could
+                    # be backlash or a momentary snag — give this direction
+                    # another chance before flipping.
+                    consecutive_stuck += 1
+                    logger.warning(
+                        "auto_calibrator.phase2_angle_stuck",
+                        cam_id=cam_id,
+                        consecutive_stuck=consecutive_stuck,
+                        stuck_limit=stuck_limit,
+                        flipped_in_phase2=flipped_in_phase2,
+                        prev_delta_steps=prev_delta_steps,
+                        angle_delta=round(angle_delta, 3),
+                        current_abs_err=round(abs(err), 3),
+                        current_position=drive.current_position,
+                    )
+                    if consecutive_stuck >= stuck_limit:
+                        if not flipped_in_phase2:
+                            old_dir = direction_sign
+                            direction_sign = -direction_sign
+                            flipped_in_phase2 = True
+                            consecutive_stuck = 0
+                            logger.warning(
+                                "auto_calibrator.phase2_direction_flip",
+                                cam_id=cam_id,
+                                reason="angle_stuck_persistent",
+                                old_direction_sign=old_dir,
+                                new_direction_sign=direction_sign,
+                                current_position=drive.current_position,
+                                current_abs_err=round(abs(err), 3),
+                            )
+                        else:
+                            logger.error(
+                                "auto_calibrator.phase2_abort_both_directions_stuck",
+                                cam_id=cam_id,
+                                current_position=drive.current_position,
+                                start_pos=start_pos,
+                                travel_from_start=drive.current_position - start_pos,
+                                current_angle=round(angle, 3),
+                                reference_angle_deg=reference_angle_deg,
+                                current_abs_err=round(abs(err), 3),
+                                hint=(
+                                    "Camera appears pinned against a physical "
+                                    "end-stop in both motor directions. "
+                                    "Manually center the camera near the "
+                                    "reference angle and restart, or relax the "
+                                    "soft envelope so the motor can clear the "
+                                    "stop."
+                                ),
+                            )
+                            await drive.move_to(start_pos, speed=settle_speed)
+                            iterations += 1
+                            return AutoCalResult(
+                                cam_id, axis, False, None, None, None, None, iterations,
+                                "phase2_both_directions_angle_stuck",
+                            )
+                        acted = True
+
+            # Real angle response this iteration — reset the stuck counter so
+            # an isolated backlash blip doesn't accumulate across many good
+            # iterations.
+            if not acted and prev_angle is not None:
+                angle_delta = abs(angle - prev_angle)
+                if angle_delta >= min_response_deg:
+                    consecutive_stuck = 0
 
             if abs(err) <= ref_threshold_deg:
                 break
@@ -302,6 +385,17 @@ async def auto_calibrate(
             pre_pos = drive.current_position
             next_pos = pre_pos + delta_steps
             if abs(next_pos - start_pos) > safety_travel:
+                logger.error(
+                    "auto_calibrator.phase2_abort_safety_travel",
+                    cam_id=cam_id,
+                    current_position=pre_pos,
+                    attempted_next=next_pos,
+                    start_pos=start_pos,
+                    safety_travel=safety_travel,
+                    current_angle=round(angle, 3),
+                    reference_angle_deg=reference_angle_deg,
+                    current_abs_err=round(abs(err), 3),
+                )
                 return AutoCalResult(
                     cam_id, axis, False, None, None, None, None, iterations,
                     "safety_travel_exceeded",
