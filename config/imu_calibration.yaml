@@ -20,8 +20,36 @@ checkpoints:
     b: []   # add via GUI or manually
 
 steps_per_degree:
-  cam1_b: 120.0   # steps per degree of rotation — calibrate via GUI
+  cam1_b: 120.0   # overwritten on each service start by auto_calibrator
   cam2_b: 120.0
+
+# Populated at each service startup by the auto-calibration routine
+# (src/pi_controller/imu/auto_calibrator.py). Absolute motor-step count at
+# which the IMU active angle reads 0°. Runtime code computes
+#   coarse_target = zero_position + target_angle_deg * steps_per_degree * sign
+# and lets converge() fine-tune afterwards. Never read from disk at runtime;
+# persisted for operator inspection between runs.
+zero_position:
+  cam1_b: null
+  cam2_b: null
+
+# Startup auto-calibration routine. Runs on every service boot after drives
+# connect, MQTT is subscribed, and IMU telemetry is flowing. Discovers
+# `zero_position` and `steps_per_degree` fresh; falls back gracefully if the
+# IMU is offline or the drive is stuck.
+auto_calibration:
+  enabled: true
+  active_angle:
+    cam1_b: roll
+    cam2_b: roll
+  probe_steps: 200          # Phase 1: direction probe step size
+  measure_steps: 500        # Phase 3: steps-per-degree fit displacement
+  zero_threshold_deg: 0.2   # |angle| <= this is considered "at zero"
+  max_iterations: 30        # Phase 2 Newton-search budget
+  max_step_per_iter: 1000   # per-iteration clamp
+  safety_travel: 8000       # abort Phase 2 if drive drifts this far from start
+  settle_speed: 0.3
+  fallback_steps_per_degree: 120.0
 
 # Closed-loop angle convergence (used when Windows sends target_angle_deg).
 # The drive is nudged toward the camera-IMU target angle over multiple iterations

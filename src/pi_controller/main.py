@@ -18,6 +18,7 @@ import yaml
 from src.pi_controller.drives.base import BaseDrive, DriveState
 from src.pi_controller.drives.gpio_drive import GPIODrive
 from src.pi_controller.drives.tinkerforge_drive import TinkerforgeDrive
+from src.pi_controller.imu.auto_calibrator import auto_calibrate
 from src.pi_controller.imu.drift_detector import DriftDetector
 from src.shared.models import (
     DriveError,
@@ -71,6 +72,10 @@ class DriveManager:
         self.drift_detector: DriftDetector | None = None
         self._sequence_running = False
         self._sequence_stop = asyncio.Event()
+        # Set once startup auto-calibration finishes (success OR graceful
+        # failure). handle_move's angle-driven branch waits briefly on this
+        # before computing a coarse target from zero_position.
+        self.autocal_complete: asyncio.Event = asyncio.Event()
         self._init_drives()
 
     def _init_drives(self) -> None:
@@ -138,11 +143,35 @@ class DriveManager:
 
         try:
             if angle_driven:
-                # Angle-first: skip the coarse motor-step move and let converge
-                # drive the axis from its current physical angle. The motor
-                # counter is unreliable after restarts, so coarse_move against
-                # target_position is not used here; resync_position re-anchors
-                # the counter after successful convergence.
+                # Angle-first. If startup auto-calibration discovered a
+                # zero_position and fresh steps_per_degree, compute a coarse
+                # target from geometry (zero + angle * spd * sign) and move
+                # there with envelope bypass before letting converge() fine-
+                # tune. If auto-cal hasn't run / failed, skip the coarse step
+                # and fall through to pure converge from the current angle.
+                zero_pos = self.drift_detector.get_zero_position(cam_id, axis="b")
+                spd = self.drift_detector.get_steps_per_degree(cam_id)
+                target_sign_val = self.drift_detector.get_target_sign(cam_id, axis="b")
+
+                if zero_pos is not None and spd > 0.0:
+                    coarse_target = (
+                        zero_pos + float(target_angle_deg) * spd * target_sign_val
+                    )
+                    was_cal = drive.calibration_mode
+                    drive.calibration_mode = True
+                    try:
+                        await drive.move_to(coarse_target, speed=speed)
+                        await asyncio.sleep(self.settling_delay_ms / 1000.0)
+                    finally:
+                        drive.calibration_mode = was_cal
+                    logger.info(
+                        "drive.coarse_move_from_zero",
+                        key=key,
+                        zero_position=zero_pos,
+                        target_angle_deg=target_angle_deg,
+                        coarse_target=coarse_target,
+                    )
+
                 result = await self.drift_detector.converge(
                     cam_id,
                     drive,
@@ -386,6 +415,90 @@ def _read_uptime() -> int:
 
 
 # ──────────────────────────────────────────────
+# Startup auto-calibration
+# ──────────────────────────────────────────────
+
+async def run_startup_autocal(
+    drive_mgr: DriveManager,
+    drift_detector: DriftDetector,
+) -> None:
+    """Discover fresh zero_position + steps_per_degree for each cam:b drive.
+
+    Runs once per service boot AFTER MQTT has connected and is receiving IMU
+    telemetry. Sets `drive_mgr.autocal_complete` when done (success or failure).
+    Angle-driven moves that arrive before this event is set fall back to
+    pure-converge (legacy behavior).
+    """
+    try:
+        # Load the auto_calibration block from the drift detector's YAML cache.
+        ac_cfg: dict = (
+            drift_detector._calibration.get("auto_calibration", {}) or {}
+        )
+        if not ac_cfg.get("enabled", True):
+            logger.info("auto_calibrator.disabled_by_config")
+            return
+
+        # Wait for MQTT client to be connected (up to 15s). Auto-cal needs
+        # request/response IMU traffic which only works post-subscribe.
+        try:
+            await asyncio.wait_for(drift_detector._mqtt._connected.wait(), timeout=15.0)
+        except asyncio.TimeoutError:
+            logger.warning("auto_calibrator.mqtt_not_connected")
+            return
+
+        # Brief settle so retained IMU telemetry / the first publish lands.
+        await asyncio.sleep(1.0)
+
+        active_angle_map: dict = ac_cfg.get("active_angle", {}) or {}
+
+        # Only Tinkerforge radial (axis-b) drives get auto-cal. Sequential so
+        # IMU responses don't get cross-wired between cameras.
+        for key, drive in list(drive_mgr.drives.items()):
+            if not key.endswith(":b"):
+                continue
+            if not isinstance(drive, TinkerforgeDrive):
+                continue
+            if getattr(drive, "_simulated", False):
+                logger.info("auto_calibrator.skip_simulated", key=key)
+                continue
+
+            cam_id = key.split(":", 1)[0]
+            active_angle = active_angle_map.get(f"{cam_id}_b", "roll")
+
+            logger.info("auto_calibrator.start", cam_id=cam_id, active_angle=active_angle)
+            result = await auto_calibrate(
+                drift_detector,
+                drive,
+                cam_id,
+                active_angle=active_angle,
+                config=ac_cfg,
+            )
+
+            if result.success:
+                drift_detector.set_zero_position(cam_id, result.zero_position, axis="b")
+                drift_detector.set_steps_per_degree(cam_id, result.steps_per_degree)
+                drift_detector.set_target_sign(cam_id, result.direction_sign, axis="b")
+                logger.info(
+                    "auto_calibrator.success",
+                    cam_id=cam_id,
+                    zero_position=result.zero_position,
+                    steps_per_degree=round(result.steps_per_degree, 3),
+                    direction_sign=result.direction_sign,
+                    iterations=result.iterations,
+                )
+            else:
+                logger.warning(
+                    "auto_calibrator.failed",
+                    cam_id=cam_id,
+                    error=result.error,
+                    iterations=result.iterations,
+                )
+    finally:
+        drive_mgr.autocal_complete.set()
+        logger.info("auto_calibrator.complete")
+
+
+# ──────────────────────────────────────────────
 # Main entry point
 # ──────────────────────────────────────────────
 
@@ -449,6 +562,7 @@ async def run_controller_headless(
         async with asyncio.TaskGroup() as tg:
             tg.create_task(mqtt.run())
             tg.create_task(heartbeat_loop(mqtt, drive_mgr))
+            tg.create_task(run_startup_autocal(drive_mgr, drive_mgr.drift_detector))
     finally:
         await drive_mgr.cleanup_all()
 
@@ -510,6 +624,7 @@ def run_controller_with_gui(
         mqtt.subscribe(SUB_ALL_IMU_TELEMETRY, drift_detector.on_imu_message)
         asyncio.create_task(mqtt.run())
         asyncio.create_task(heartbeat_loop(mqtt, drive_mgr))
+        asyncio.create_task(run_startup_autocal(drive_mgr, drift_detector))
         logger.info("background_tasks.started")
 
     async def on_shutdown() -> None:

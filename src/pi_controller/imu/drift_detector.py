@@ -638,6 +638,25 @@ class DriftDetector:
         self._calibration.setdefault("steps_per_degree", {})[f"{cam_id}_b"] = value
         self._save_calibration()
 
+    def get_zero_position(self, cam_id: str, axis: str = "b") -> float | None:
+        """Motor-step count where active-angle reads 0°. Discovered at startup by
+        auto_calibrator; None until auto-cal has completed successfully."""
+        val = (
+            self._calibration
+            .get("zero_position", {})
+            .get(f"{cam_id}_{axis}")
+        )
+        return float(val) if val is not None else None
+
+    def set_zero_position(self, cam_id: str, value: float, axis: str = "b") -> None:
+        self._calibration.setdefault("zero_position", {})[f"{cam_id}_{axis}"] = value
+        self._save_calibration()
+
+    def set_target_sign(self, cam_id: str, sign: int, axis: str = "b") -> None:
+        conv = self._calibration.setdefault("convergence", {})
+        conv.setdefault("steps_per_degree_sign", {})[f"{cam_id}_{axis}"] = int(sign)
+        self._save_calibration()
+
     def get_target_sign(self, cam_id: str, axis: str = "b") -> int:
         """Per-camera sign used to turn a user-entered angle magnitude into a
         signed target for converge(). Mirrors `steps_per_degree_sign` in the
