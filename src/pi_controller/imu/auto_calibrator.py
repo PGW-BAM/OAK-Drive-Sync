@@ -117,94 +117,102 @@ async def auto_calibrate(
             reference_angle_deg=reference_angle_deg,
         )
 
-        # ───────────── Phase 1: direction probe ─────────────
+        # ───────────── Phase 1: direction probe (escalating) ─────────────
         # Probe toward the target reference angle so the first commanded
-        # move never drives the camera AWAY from where we need to go (and
-        # in particular never pushes a motor that's already near a
-        # physical end-stop deeper into it). We guess direction_sign=+1
-        # and pick a step direction that — under that guess — reduces the
-        # angle error. If the guess is wrong, we detect it from the
-        # measured delta and flip direction_sign. If the camera can't
-        # rotate in the first chosen direction (at a physical end-stop),
-        # we reverse and retry before giving up. The angle (not the motor
-        # position) is the authoritative signal: Tinkerforge steppers have
-        # no stall feedback, so drive.current_position always equals the
-        # commanded target regardless of whether the motor physically
-        # moved.
-        probe_dir = 1 if reference_angle_deg > start_angle else -1
-        probe_offset = probe_dir * probe_steps
-        await drive.move_to(start_pos + probe_offset, speed=settle_speed)
-        iterations += 1
-        probe_angle = await _read_angle(
-            drift_detector, cam_id, active_angle, "autocal:phase1_probe"
-        )
-        if probe_angle is None:
-            return AutoCalResult(
-                cam_id, axis, False, None, None, None, None, iterations, "imu_timeout"
-            )
-        delta_pos = drive.current_position - start_pos
-        delta_angle = probe_angle - start_angle
-        logger.info(
-            "auto_calibrator.phase1_probe",
-            cam_id=cam_id,
-            start_angle=round(start_angle, 3),
-            probe_angle=round(probe_angle, 3),
-            delta_deg=round(delta_angle, 3),
-            delta_pos=delta_pos,
-            probe_offset=probe_offset,
-        )
+        # move never drives the camera AWAY from where we need to go.
+        # Small probes (e.g. ±200 steps) often live entirely inside
+        # mechanical backlash and produce no camera rotation, even when
+        # the mechanism is perfectly fine — so we escalate step size
+        # (1×, 3×, 5× `probe_steps`) in the preferred direction before
+        # reversing, and repeat the escalation in reverse before giving
+        # up. The angle (not the motor position) is the authoritative
+        # signal: Tinkerforge steppers have no stall feedback, so
+        # drive.current_position always equals the commanded target
+        # regardless of whether the motor physically moved.
+        preferred_dir = 1 if reference_angle_deg > start_angle else -1
+        probe_multipliers = (1, 3, 5)
+        probe_order: list[tuple[int, int]] = []
+        for direction in (preferred_dir, -preferred_dir):
+            for mult in probe_multipliers:
+                probe_order.append((direction, mult))
 
-        # Camera didn't rotate — either we're pinned at a physical end-stop
-        # in this direction, or the first probe's guessed direction was wrong
-        # (camera can't move toward target). Return to start and probe the
-        # other way before giving up.
-        if abs(delta_angle) < motion_threshold_deg:
-            logger.warning(
-                "auto_calibrator.phase1_no_angle_retry_reverse",
-                cam_id=cam_id,
-                delta_deg=round(delta_angle, 3),
-                delta_pos=delta_pos,
-                probe_offset=probe_offset,
-            )
-            await drive.move_to(start_pos, speed=settle_speed)
-            iterations += 1
-            probe_dir = -probe_dir
-            probe_offset = probe_dir * probe_steps
+        delta_pos = 0.0
+        delta_angle = 0.0
+        probe_found = False
+        for probe_dir, mult in probe_order:
+            probe_offset = probe_dir * probe_steps * mult
+            if abs(probe_offset) > safety_travel:
+                continue  # don't probe beyond safety budget
             await drive.move_to(start_pos + probe_offset, speed=settle_speed)
             iterations += 1
             probe_angle = await _read_angle(
-                drift_detector, cam_id, active_angle, "autocal:phase1_probe_reverse"
+                drift_detector,
+                cam_id,
+                active_angle,
+                f"autocal:phase1_probe_dir{probe_dir:+d}_x{mult}",
             )
             if probe_angle is None:
                 return AutoCalResult(
                     cam_id, axis, False, None, None, None, None, iterations, "imu_timeout"
                 )
-            delta_pos = drive.current_position - start_pos
-            delta_angle = probe_angle - start_angle
+            cur_delta_pos = drive.current_position - start_pos
+            cur_delta_angle = probe_angle - start_angle
             logger.info(
-                "auto_calibrator.phase1_probe_reverse",
+                "auto_calibrator.phase1_probe_attempt",
                 cam_id=cam_id,
-                probe_angle=round(probe_angle, 3),
-                delta_deg=round(delta_angle, 3),
-                delta_pos=delta_pos,
+                probe_dir=probe_dir,
+                step_multiplier=mult,
                 probe_offset=probe_offset,
+                start_angle=round(start_angle, 3),
+                probe_angle=round(probe_angle, 3),
+                delta_deg=round(cur_delta_angle, 3),
+                delta_pos=cur_delta_pos,
+                motion_threshold_deg=motion_threshold_deg,
             )
-            if abs(delta_angle) < motion_threshold_deg:
-                # Both directions: no angle response. Either the camera is
-                # pinned between two nearby end-stops, the mechanism is
-                # decoupled, or active_angle is the wrong IMU axis for this
-                # mounting. Leave the drive at start_pos and bail with a
-                # diagnostic so the operator can investigate.
-                await drive.move_to(start_pos, speed=settle_speed)
-                iterations += 1
-                return AutoCalResult(
-                    cam_id, axis, False, None, None, None, None, iterations,
-                    "no_angle_response_both_directions",
-                )
+            if abs(cur_delta_angle) >= motion_threshold_deg:
+                delta_pos = cur_delta_pos
+                delta_angle = cur_delta_angle
+                probe_found = True
+                break
+            # No response yet — return to start_pos and try the next probe
+            # (larger magnitude, or reversed direction).
+            await drive.move_to(start_pos, speed=settle_speed)
+            iterations += 1
+
+        if not probe_found:
+            logger.error(
+                "auto_calibrator.phase1_no_angle_response",
+                cam_id=cam_id,
+                start_pos=start_pos,
+                start_angle=round(start_angle, 3),
+                attempted_multipliers=list(probe_multipliers),
+                probe_steps=probe_steps,
+                hint=(
+                    "No IMU response at any probe size up to "
+                    f"{probe_steps * max(probe_multipliers)} steps in either "
+                    "direction. Likely a disengaged drive coupling, camera "
+                    "pinned between tight end-stops, or wrong active_angle "
+                    "axis for this mounting."
+                ),
+            )
+            await drive.move_to(start_pos, speed=settle_speed)
+            iterations += 1
+            return AutoCalResult(
+                cam_id, axis, False, None, None, None, None, iterations,
+                "no_angle_response_both_directions",
+            )
 
         # direction_sign = +1 iff positive motor steps produce positive angle delta.
         direction_sign = 1 if (delta_angle * delta_pos) > 0 else -1
         est_spd = abs(delta_pos) / abs(delta_angle)
+        logger.info(
+            "auto_calibrator.phase1_direction_locked",
+            cam_id=cam_id,
+            direction_sign=direction_sign,
+            est_spd=round(est_spd, 3),
+            delta_pos=delta_pos,
+            delta_angle=round(delta_angle, 3),
+        )
 
         # Return to start so Phase 2 searches symmetrically.
         await drive.move_to(start_pos, speed=settle_speed)
@@ -222,10 +230,11 @@ async def auto_calibrate(
         #                     overshot. Don't flip; just let the re-estimated
         #                     est_spd shrink the next step.
         #   - angle-stuck:    commanded a meaningful move, IMU didn't respond.
-        #                     Could be backlash or a real limit. Require TWO
-        #                     consecutive stuck iterations in the same direction
-        #                     before acting, so backlash gets a chance to break
-        #                     through on retry.
+        #                     Escalate the step size on each retry (1× → 2× → 4×
+        #                     max_step_per_iter) so a larger burst can break
+        #                     through backlash / gravity-driven dead zones.
+        #                     Up to `stuck_limit` stuck retries per direction
+        #                     before flipping direction_sign or aborting.
         #
         # est_spd is re-estimated after every substantive iteration (smoothed)
         # because Phase 1's probe often runs inside backlash and underestimates
@@ -245,7 +254,11 @@ async def auto_calibrate(
         prev_delta_steps: int = 0
         flipped_in_phase2 = False
         consecutive_stuck = 0
-        stuck_limit = 2  # need this many consecutive stuck iterations to act
+        stuck_limit = 4         # stuck iterations per direction before flip/abort
+        stuck_multiplier = 1    # scales step size on stuck to break through backlash
+        # Cap escalation at 2× so 4 stuck iterations (1×+3×2×=7× max_step_per_iter)
+        # stay inside safety_travel=8000 with max_step_per_iter=1000.
+        stuck_mult_cap = 2
         for _ in range(max_iterations):
             angle = await _read_angle(
                 drift_detector, cam_id, active_angle, "autocal:phase2_search"
@@ -367,14 +380,18 @@ async def auto_calibrate(
                     acted = True
                 elif angle_stuck:
                     # Didn't regress but also didn't move meaningfully. Could
-                    # be backlash or a momentary snag — give this direction
-                    # another chance before flipping.
+                    # be backlash, gravity-driven dead zone, or an end-stop.
+                    # Escalate step size (1× → 2× → 4× max_step_per_iter) on
+                    # each retry so a subsequent attempt can break through a
+                    # dead zone that smaller moves couldn't.
                     consecutive_stuck += 1
+                    stuck_multiplier = min(stuck_mult_cap, max(2, stuck_multiplier * 2))
                     logger.warning(
                         "auto_calibrator.phase2_angle_stuck",
                         cam_id=cam_id,
                         consecutive_stuck=consecutive_stuck,
                         stuck_limit=stuck_limit,
+                        stuck_multiplier=stuck_multiplier,
                         flipped_in_phase2=flipped_in_phase2,
                         prev_delta_steps=prev_delta_steps,
                         angle_delta=round(angle_delta, 3),
@@ -387,6 +404,7 @@ async def auto_calibrate(
                             direction_sign = -direction_sign
                             flipped_in_phase2 = True
                             consecutive_stuck = 0
+                            stuck_multiplier = 1
                             logger.warning(
                                 "auto_calibrator.phase2_direction_flip",
                                 cam_id=cam_id,
@@ -423,22 +441,43 @@ async def auto_calibrate(
                             )
                         acted = True
 
-            # Real angle response this iteration — reset the stuck counter so
-            # an isolated backlash blip doesn't accumulate across many good
-            # iterations.
+            # Real angle response this iteration — reset the stuck counter
+            # AND the step-size escalation so an isolated backlash blip
+            # doesn't keep forcing oversized moves once the mechanism frees up.
             if not acted and prev_angle is not None:
                 angle_delta = abs(angle - prev_angle)
                 if angle_delta >= min_response_deg:
+                    if consecutive_stuck > 0 or stuck_multiplier > 1:
+                        logger.info(
+                            "auto_calibrator.phase2_unstuck",
+                            cam_id=cam_id,
+                            angle_delta=round(angle_delta, 3),
+                            consecutive_stuck_reset_from=consecutive_stuck,
+                            stuck_multiplier_reset_from=stuck_multiplier,
+                        )
                     consecutive_stuck = 0
+                    stuck_multiplier = 1
 
             if abs(err) <= ref_threshold_deg:
                 break
 
-            delta_steps = int(-err * est_spd * direction_sign)
-            if delta_steps > max_step_per_iter:
-                delta_steps = max_step_per_iter
-            elif delta_steps < -max_step_per_iter:
-                delta_steps = -max_step_per_iter
+            if stuck_multiplier > 1:
+                # Stuck mode: push with a fixed burst in the target direction
+                # rather than a tiny err-scaled step. A small commanded move
+                # after a stuck iteration would almost certainly re-stick —
+                # we need a larger push to break through backlash / gravity.
+                motor_dir = (
+                    -err_sign * direction_sign
+                    if err_sign != 0
+                    else direction_sign
+                )
+                delta_steps = motor_dir * max_step_per_iter * stuck_multiplier
+            else:
+                delta_steps = int(-err * est_spd * direction_sign)
+                if delta_steps > max_step_per_iter:
+                    delta_steps = max_step_per_iter
+                elif delta_steps < -max_step_per_iter:
+                    delta_steps = -max_step_per_iter
 
             pre_pos = drive.current_position
             next_pos = pre_pos + delta_steps
