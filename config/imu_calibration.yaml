@@ -68,6 +68,15 @@ auto_calibration:
                               # struggle to overcome static friction on an
                               # unevenly-loaded radial drive; imu_settle_ms
                               # handles the post-move oscillation instead.
+  motor_current_boost_mA: 1800 # temporarily raise Tinkerforge motor current
+                              # during auto-cal. The Silent Stepper 2.0 has no
+                              # stall detection — when a cam is parked near
+                              # ±90° roll, gravity can stall the motor at the
+                              # default 1200 mA while the bricklet still fires
+                              # position_reached, producing flat IMU across
+                              # every probe. 1800 mA gives enough torque to
+                              # break free. Original current is restored when
+                              # auto-cal exits. Set to 0 to disable the boost.
   imu_settle_ms: 400          # wait this long after each move before sampling
                               # the IMU — accelerometer-derived roll swings for
                               # several hundred ms after the motor stops; a too-

@@ -274,6 +274,50 @@ class TinkerforgeDrive(BaseDrive):
                     error=str(exc),
                 )
 
+    def get_motor_current_mA(self) -> int | None:
+        """Return the bricklet's currently programmed motor current in mA.
+
+        Returns None in simulation or if the stepper handle is not yet set up.
+        Used by auto-cal to snapshot the running current before boosting for a
+        calibration pass.
+        """
+        if self._stepper is None or self._simulated:
+            return None
+        try:
+            return int(self._stepper.get_motor_current())
+        except Exception as exc:
+            logger.warning(
+                "tinkerforge_drive.get_motor_current_failed",
+                key=self.key,
+                error=str(exc),
+            )
+            return None
+
+    def set_motor_current_mA(self, value: int) -> None:
+        """Reprogram the bricklet's motor current (mA) at runtime.
+
+        Intended for auto-cal to temporarily raise torque so a cam near ±90°
+        roll (where gravity generates significant off-axis load) can actually
+        rotate. Restore the snapshot value afterward.
+        """
+        self.motor_current = int(value)
+        if self._stepper is None or self._simulated:
+            return
+        try:
+            self._stepper.set_motor_current(int(value))
+            logger.info(
+                "tinkerforge_drive.motor_current_changed",
+                key=self.key,
+                motor_current_mA=int(value),
+            )
+        except Exception as exc:
+            logger.error(
+                "tinkerforge_drive.set_motor_current_failed",
+                key=self.key,
+                value=int(value),
+                error=str(exc),
+            )
+
     def set_current_position(self, value: float) -> None:
         """Override: also sync the Tinkerforge bricklet's internal counter."""
         if self._state not in (DriveState.IDLE, DriveState.REACHED):

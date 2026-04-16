@@ -121,6 +121,34 @@ async def auto_calibrate(
     start_pos = drive.current_position
     was_cal_mode = drive.calibration_mode
     drive.calibration_mode = True
+
+    # Temporarily raise motor current for the calibration pass. A cam parked
+    # near ±90° roll generates significant off-axis gravitational load; at the
+    # default 1200 mA the Silent Stepper 2.0 can stall silently (no stall
+    # detection on this part) so the bricklet reports every position_reached
+    # while the camera hasn't actually rotated — that produces the symptom of
+    # flat IMU across a ±2000-step sweep in both directions. Boosting to 1800
+    # mA during auto-cal lets the motor overcome the load. Snapshot and
+    # restore the prior value so runtime moves don't run hot.
+    boost_current_mA = int(config.get("motor_current_boost_mA", 0))
+    orig_current_mA: int | None = None
+    if boost_current_mA > 0 and hasattr(drive, "get_motor_current_mA"):
+        try:
+            orig_current_mA = drive.get_motor_current_mA()
+            if orig_current_mA is not None and boost_current_mA > orig_current_mA:
+                drive.set_motor_current_mA(boost_current_mA)
+                logger.info(
+                    "auto_calibrator.motor_current_boost",
+                    cam_id=cam_id,
+                    original_mA=orig_current_mA,
+                    boosted_mA=boost_current_mA,
+                )
+            else:
+                orig_current_mA = None  # no change needed — skip restore
+        except Exception:
+            logger.exception("auto_calibrator.motor_current_boost_failed", cam_id=cam_id)
+            orig_current_mA = None
+
     iterations = 0
     try:
         # ───────────── Phase 0: detect reference_angle from sign ─────────────
@@ -619,3 +647,16 @@ async def auto_calibrate(
         )
     finally:
         drive.calibration_mode = was_cal_mode
+        if orig_current_mA is not None and hasattr(drive, "set_motor_current_mA"):
+            try:
+                drive.set_motor_current_mA(orig_current_mA)
+                logger.info(
+                    "auto_calibrator.motor_current_restored",
+                    cam_id=cam_id,
+                    motor_current_mA=orig_current_mA,
+                )
+            except Exception:
+                logger.exception(
+                    "auto_calibrator.motor_current_restore_failed",
+                    cam_id=cam_id,
+                )
