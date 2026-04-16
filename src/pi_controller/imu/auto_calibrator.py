@@ -157,10 +157,16 @@ async def auto_calibrate(
         # regardless of whether the motor physically moved.
         preferred_dir = 1 if reference_angle_deg > start_angle else -1
         probe_multipliers = (1, 3, 5)
+        # Alternate directions on each size before escalating: if the 1× probe
+        # in the preferred direction reads 0°, the drive is almost certainly
+        # pressed against an end-stop in THAT direction — more steps the same
+        # way just push harder into the stop. Trying 1× the other way first
+        # catches that case in one move instead of three. Only after both 1×
+        # probes fail do we escalate to 3×, and so on.
         probe_order: list[tuple[int, int]] = []
-        for direction in (preferred_dir, -preferred_dir):
-            for mult in probe_multipliers:
-                probe_order.append((direction, mult))
+        for mult in probe_multipliers:
+            probe_order.append((preferred_dir, mult))
+            probe_order.append((-preferred_dir, mult))
 
         delta_pos = 0.0
         delta_angle = 0.0
