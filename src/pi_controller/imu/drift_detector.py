@@ -638,18 +638,33 @@ class DriftDetector:
         self._calibration.setdefault("steps_per_degree", {})[f"{cam_id}_b"] = value
         self._save_calibration()
 
-    def get_zero_position(self, cam_id: str, axis: str = "b") -> float | None:
-        """Motor-step count where active-angle reads 0°. Discovered at startup by
-        auto_calibrator; None until auto-cal has completed successfully."""
+    def get_reference_position(self, cam_id: str, axis: str = "b") -> float | None:
+        """Motor-step count at which the IMU active-angle reads the per-camera
+        reference_angle_deg (−90° for upside-down, +90° for right-side-up).
+        Discovered at startup by auto_calibrator; None until auto-cal succeeds."""
         val = (
             self._calibration
-            .get("zero_position", {})
+            .get("reference_position", {})
             .get(f"{cam_id}_{axis}")
         )
         return float(val) if val is not None else None
 
-    def set_zero_position(self, cam_id: str, value: float, axis: str = "b") -> None:
-        self._calibration.setdefault("zero_position", {})[f"{cam_id}_{axis}"] = value
+    def set_reference_position(self, cam_id: str, value: float, axis: str = "b") -> None:
+        self._calibration.setdefault("reference_position", {})[f"{cam_id}_{axis}"] = value
+        self._save_calibration()
+
+    def get_reference_angle_deg(self, cam_id: str, axis: str = "b") -> float | None:
+        """Per-camera rest anchor (−90° or +90°). Auto-detected at each startup
+        by auto_calibrator from the sign of the first IMU reading."""
+        val = (
+            self._calibration
+            .get("reference_angle_deg", {})
+            .get(f"{cam_id}_{axis}")
+        )
+        return float(val) if val is not None else None
+
+    def set_reference_angle_deg(self, cam_id: str, value: float, axis: str = "b") -> None:
+        self._calibration.setdefault("reference_angle_deg", {})[f"{cam_id}_{axis}"] = value
         self._save_calibration()
 
     def set_target_sign(self, cam_id: str, sign: int, axis: str = "b") -> None:

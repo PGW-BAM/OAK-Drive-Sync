@@ -74,7 +74,7 @@ class DriveManager:
         self._sequence_stop = asyncio.Event()
         # Set once startup auto-calibration finishes (success OR graceful
         # failure). handle_move's angle-driven branch waits briefly on this
-        # before computing a coarse target from zero_position.
+        # before computing a coarse target from reference_position.
         self.autocal_complete: asyncio.Event = asyncio.Event()
         self._init_drives()
 
@@ -144,18 +144,23 @@ class DriveManager:
         try:
             if angle_driven:
                 # Angle-first. If startup auto-calibration discovered a
-                # zero_position and fresh steps_per_degree, compute a coarse
-                # target from geometry (zero + angle * spd * sign) and move
-                # there with envelope bypass before letting converge() fine-
-                # tune. If auto-cal hasn't run / failed, skip the coarse step
-                # and fall through to pure converge from the current angle.
-                zero_pos = self.drift_detector.get_zero_position(cam_id, axis="b")
+                # reference_position + reference_angle_deg and fresh
+                # steps_per_degree, compute the coarse target from geometry:
+                #   coarse = ref_pos + (target - ref_angle) * spd * sign
+                # cam1 mounts upside-down so its reference_angle_deg is −90;
+                # cam2 is right-side-up so +90. Move there with envelope
+                # bypass before letting converge() fine-tune. If auto-cal
+                # hasn't produced a reference yet, skip the coarse step and
+                # fall through to pure converge from the current angle.
+                ref_pos = self.drift_detector.get_reference_position(cam_id, axis="b")
+                ref_angle = self.drift_detector.get_reference_angle_deg(cam_id, axis="b")
                 spd = self.drift_detector.get_steps_per_degree(cam_id)
                 target_sign_val = self.drift_detector.get_target_sign(cam_id, axis="b")
 
-                if zero_pos is not None and spd > 0.0:
+                if ref_pos is not None and ref_angle is not None and spd > 0.0:
                     coarse_target = (
-                        zero_pos + float(target_angle_deg) * spd * target_sign_val
+                        ref_pos
+                        + (float(target_angle_deg) - ref_angle) * spd * target_sign_val
                     )
                     was_cal = drive.calibration_mode
                     drive.calibration_mode = True
@@ -165,9 +170,10 @@ class DriveManager:
                     finally:
                         drive.calibration_mode = was_cal
                     logger.info(
-                        "drive.coarse_move_from_zero",
+                        "drive.coarse_move_from_reference",
                         key=key,
-                        zero_position=zero_pos,
+                        reference_position=ref_pos,
+                        reference_angle_deg=ref_angle,
                         target_angle_deg=target_angle_deg,
                         coarse_target=coarse_target,
                     )
@@ -422,7 +428,8 @@ async def run_startup_autocal(
     drive_mgr: DriveManager,
     drift_detector: DriftDetector,
 ) -> None:
-    """Discover fresh zero_position + steps_per_degree for each cam:b drive.
+    """Discover fresh reference_position + reference_angle + steps_per_degree
+    for each cam:b drive.
 
     Runs once per service boot AFTER MQTT has connected and is receiving IMU
     telemetry. Sets `drive_mgr.autocal_complete` when done (success or failure).
@@ -475,13 +482,19 @@ async def run_startup_autocal(
             )
 
             if result.success:
-                drift_detector.set_zero_position(cam_id, result.zero_position, axis="b")
+                drift_detector.set_reference_position(
+                    cam_id, result.reference_position, axis="b"
+                )
+                drift_detector.set_reference_angle_deg(
+                    cam_id, result.reference_angle_deg, axis="b"
+                )
                 drift_detector.set_steps_per_degree(cam_id, result.steps_per_degree)
                 drift_detector.set_target_sign(cam_id, result.direction_sign, axis="b")
                 logger.info(
                     "auto_calibrator.success",
                     cam_id=cam_id,
-                    zero_position=result.zero_position,
+                    reference_angle_deg=result.reference_angle_deg,
+                    reference_position=result.reference_position,
                     steps_per_degree=round(result.steps_per_degree, 3),
                     direction_sign=result.direction_sign,
                     iterations=result.iterations,

@@ -2,15 +2,20 @@
 Auto-calibration of radial (axis-b) drives at service startup.
 
 The Tinkerforge stepper's internal position counter zeroes on every power-up
-and has no intrinsic geometric meaning — the physical "0°" orientation of
+and has no intrinsic geometric meaning — the physical rest orientation of
 the camera maps to a different motor-step value each boot. This module
-discovers two per-camera-per-axis quantities live at startup:
+discovers three per-camera-per-axis quantities live at startup:
 
-  zero_position[cam_id_b]   — motor-step count where IMU active-angle reads 0°
-  steps_per_degree[cam_id_b] — signed magnitude of steps-per-degree-of-IMU
+  reference_angle_deg[cam_id_b] — the physical mounting's rest-side anchor:
+      −90° for upside-down (cam1), +90° for right-side-up (cam2). Auto-
+      detected from the sign of the first IMU reading.
+  reference_position[cam_id_b]  — motor-step count where IMU active-angle
+      reads the reference_angle (to within `reference_threshold_deg`).
+  steps_per_degree[cam_id_b]    — signed magnitude of steps-per-degree-of-IMU
 
 Runtime code (main.handle_move) can then compute
-  coarse_target = zero_position + target_angle_deg * steps_per_degree * sign
+  coarse_target = reference_position
+                + (target_angle_deg - reference_angle_deg) * spd * sign
 instead of relying on the teach-time motor-position snapshot sent by Windows.
 
 All moves run inside `drive.calibration_mode = True` so the envelope doesn't
@@ -19,7 +24,6 @@ clamp probes (motor counter may be outside [min,max] after restart drift).
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -38,9 +42,10 @@ class AutoCalResult:
     cam_id: str
     axis: str  # always "b" for now
     success: bool
-    zero_position: float | None
-    steps_per_degree: float | None  # magnitude; sign stored separately
-    direction_sign: int | None      # +1 if +steps increases active-angle, else -1
+    reference_position: float | None   # motor-step count at reference_angle_deg
+    reference_angle_deg: float | None  # ±90, auto-detected per cam
+    steps_per_degree: float | None     # magnitude; sign stored separately
+    direction_sign: int | None         # +1 if +steps increases active-angle, else -1
     iterations: int
     error: str | None
 
@@ -72,34 +77,47 @@ async def auto_calibrate(
     active_angle: Literal["roll", "pitch"] = "roll",
     config: dict,
 ) -> AutoCalResult:
-    """Discover zero_position and steps_per_degree for a single cam:b drive.
+    """Discover (reference_angle_deg, reference_position, steps_per_degree) for
+    a single cam:b drive.
 
     `config` is the `auto_calibration` sub-dict from imu_calibration.yaml.
     """
     axis = "b"
     probe_steps = int(config.get("probe_steps", 200))
     measure_steps = int(config.get("measure_steps", 500))
-    zero_threshold_deg = float(config.get("zero_threshold_deg", 0.2))
+    ref_threshold_deg = float(config.get("reference_threshold_deg", 0.5))
+    motion_threshold_deg = float(config.get("motion_threshold_deg", 0.2))
     max_iterations = int(config.get("max_iterations", 30))
     max_step_per_iter = int(config.get("max_step_per_iter", 1000))
     safety_travel = int(config.get("safety_travel", 8000))
     settle_speed = float(config.get("settle_speed", 0.3))
-    yaml_default_spd = float(config.get("fallback_steps_per_degree", 120.0))
 
     start_pos = drive.current_position
     was_cal_mode = drive.calibration_mode
     drive.calibration_mode = True
     iterations = 0
     try:
-        # ───────────── Phase 1: direction probe ─────────────
+        # ───────────── Phase 0: detect reference_angle from sign ─────────────
         start_angle = await _read_angle(
-            drift_detector, cam_id, active_angle, "autocal:phase1_start"
+            drift_detector, cam_id, active_angle, "autocal:phase0_sign"
         )
         if start_angle is None:
             return AutoCalResult(
-                cam_id, axis, False, None, None, None, iterations, "imu_timeout"
+                cam_id, axis, False, None, None, None, None, iterations, "imu_timeout"
             )
+        # Cam1 is mounted upside-down → IMU always reads negative.
+        # Cam2 is right-side-up → IMU always reads positive.
+        # The sign of the first reading tells us which rest anchor (−90 or +90)
+        # this camera's axis-b drive belongs to.
+        reference_angle_deg = -90.0 if start_angle < 0 else 90.0
+        logger.info(
+            "auto_calibrator.phase0_reference",
+            cam_id=cam_id,
+            start_angle=round(start_angle, 3),
+            reference_angle_deg=reference_angle_deg,
+        )
 
+        # ───────────── Phase 1: direction probe ─────────────
         await drive.move_to(start_pos + probe_steps, speed=settle_speed)
         iterations += 1
         probe_angle = await _read_angle(
@@ -107,7 +125,7 @@ async def auto_calibrate(
         )
         if probe_angle is None:
             return AutoCalResult(
-                cam_id, axis, False, None, None, None, iterations, "imu_timeout"
+                cam_id, axis, False, None, None, None, None, iterations, "imu_timeout"
             )
 
         delta = probe_angle - start_angle
@@ -120,13 +138,14 @@ async def auto_calibrate(
             probe_steps=probe_steps,
         )
 
-        if abs(delta) < zero_threshold_deg:
+        if abs(delta) < motion_threshold_deg:
             # Motor moved but camera angle didn't — stuck, uncoupled, or
             # probe too small. Abort so operator can investigate.
             await drive.move_to(start_pos, speed=settle_speed)
             iterations += 1
             return AutoCalResult(
-                cam_id, axis, False, None, None, None, iterations, "probe_no_motion"
+                cam_id, axis, False, None, None, None, None, iterations,
+                "probe_no_motion",
             )
 
         direction_sign = 1 if delta > 0 else -1
@@ -136,20 +155,23 @@ async def auto_calibrate(
         await drive.move_to(start_pos, speed=settle_speed)
         iterations += 1
 
-        # ───────────── Phase 2: zero-angle Newton search ─────────────
+        # ───────────── Phase 2: reference-angle Newton search ─────────────
+        # Correction drives (current_angle - reference_angle_deg) toward zero.
         for _ in range(max_iterations):
             angle = await _read_angle(
                 drift_detector, cam_id, active_angle, "autocal:phase2_search"
             )
             if angle is None:
                 return AutoCalResult(
-                    cam_id, axis, False, None, None, None, iterations, "imu_timeout"
+                    cam_id, axis, False, None, None, None, None, iterations,
+                    "imu_timeout",
                 )
 
-            if abs(angle) <= zero_threshold_deg:
+            err = angle - reference_angle_deg
+            if abs(err) <= ref_threshold_deg:
                 break
 
-            delta_steps = int(-angle * est_spd * direction_sign)
+            delta_steps = int(-err * est_spd * direction_sign)
             if delta_steps > max_step_per_iter:
                 delta_steps = max_step_per_iter
             elif delta_steps < -max_step_per_iter:
@@ -158,13 +180,7 @@ async def auto_calibrate(
             next_pos = drive.current_position + delta_steps
             if abs(next_pos - start_pos) > safety_travel:
                 return AutoCalResult(
-                    cam_id,
-                    axis,
-                    False,
-                    None,
-                    None,
-                    None,
-                    iterations,
+                    cam_id, axis, False, None, None, None, None, iterations,
                     "safety_travel_exceeded",
                 )
 
@@ -172,49 +188,47 @@ async def auto_calibrate(
             iterations += 1
         else:
             return AutoCalResult(
-                cam_id,
-                axis,
-                False,
-                None,
-                None,
-                None,
-                iterations,
-                "zero_not_found",
+                cam_id, axis, False, None, None, None, None, iterations,
+                "reference_not_found",
             )
 
-        zero_position = drive.current_position
+        reference_position = drive.current_position
         logger.info(
-            "auto_calibrator.phase2_zero_found",
+            "auto_calibrator.phase2_reference_found",
             cam_id=cam_id,
-            zero_position=zero_position,
+            reference_position=reference_position,
+            reference_angle_deg=reference_angle_deg,
             iterations=iterations,
         )
 
         # ───────────── Phase 3: steps-per-degree measurement ─────────────
-        await drive.move_to(zero_position + measure_steps, speed=settle_speed)
+        await drive.move_to(reference_position + measure_steps, speed=settle_speed)
         iterations += 1
         angle_pos = await _read_angle(
             drift_detector, cam_id, active_angle, "autocal:phase3_pos"
         )
         if angle_pos is None:
             return AutoCalResult(
-                cam_id, axis, False, None, None, None, iterations, "imu_timeout"
+                cam_id, axis, False, None, None, None, None, iterations,
+                "imu_timeout",
             )
 
-        await drive.move_to(zero_position - measure_steps, speed=settle_speed)
+        await drive.move_to(reference_position - measure_steps, speed=settle_speed)
         iterations += 1
         angle_neg = await _read_angle(
             drift_detector, cam_id, active_angle, "autocal:phase3_neg"
         )
         if angle_neg is None:
             return AutoCalResult(
-                cam_id, axis, False, None, None, None, iterations, "imu_timeout"
+                cam_id, axis, False, None, None, None, None, iterations,
+                "imu_timeout",
             )
 
         span = abs(angle_pos - angle_neg)
-        if span < zero_threshold_deg:
+        if span < motion_threshold_deg:
             return AutoCalResult(
-                cam_id, axis, False, None, None, None, iterations, "span_too_small"
+                cam_id, axis, False, None, None, None, None, iterations,
+                "span_too_small",
             )
         steps_per_degree = (2.0 * measure_steps) / span
 
@@ -225,7 +239,6 @@ async def auto_calibrate(
             angle_neg=round(angle_neg, 3),
             span_deg=round(span, 3),
             steps_per_degree=round(steps_per_degree, 3),
-            fallback_spd=yaml_default_spd,
         )
 
         # ───────────── Phase 4: return to origin ─────────────
@@ -236,7 +249,8 @@ async def auto_calibrate(
             cam_id=cam_id,
             axis=axis,
             success=True,
-            zero_position=float(zero_position),
+            reference_position=float(reference_position),
+            reference_angle_deg=float(reference_angle_deg),
             steps_per_degree=float(steps_per_degree),
             direction_sign=direction_sign,
             iterations=iterations,
@@ -245,7 +259,8 @@ async def auto_calibrate(
     except Exception as exc:  # defensive — any drive/IMU fault
         logger.exception("auto_calibrator.unexpected_error", cam_id=cam_id)
         return AutoCalResult(
-            cam_id, axis, False, None, None, None, iterations, f"exception:{exc}"
+            cam_id, axis, False, None, None, None, None, iterations,
+            f"exception:{exc}",
         )
     finally:
         drive.calibration_mode = was_cal_mode
