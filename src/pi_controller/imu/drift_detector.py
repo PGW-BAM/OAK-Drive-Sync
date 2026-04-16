@@ -10,6 +10,7 @@ drift exceeds the configured threshold.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import uuid
 from dataclasses import dataclass
@@ -332,7 +333,13 @@ class DriftDetector:
 
             last_request_id = imu.request_id or ""
             last_actual = imu.roll_deg if active_angle == "roll" else imu.pitch_deg
-            err = last_actual - target_angle_deg
+            # Magnitude-based error: compare |IMU| vs |target| so that cam2's
+            # flipped mounting (target is negative of cam1's value for the same
+            # physical orientation) converges identically. Positive err means
+            # |IMU| is too large and we must move toward zero; negative err means
+            # |IMU| is too small and we must move away from zero in the direction
+            # of sign(target).
+            err = abs(last_actual) - abs(target_angle_deg)
 
             logger.info(
                 "drift_detector.converge_iteration",
@@ -341,6 +348,8 @@ class DriftDetector:
                 active_angle=active_angle,
                 target_deg=round(target_angle_deg, 3),
                 actual_deg=round(last_actual, 3),
+                abs_target_deg=round(abs(target_angle_deg), 3),
+                abs_actual_deg=round(abs(last_actual), 3),
                 error_deg=round(err, 3),
                 threshold_deg=threshold_deg,
             )
@@ -377,9 +386,14 @@ class DriftDetector:
                     event=event,
                 )
 
-            # Not converged yet — apply a corrective nudge. Negate err because
-            # drift = actual - target, and we want to move toward target.
-            raw_correction = int(-err * steps_per_deg * sign)
+            # Not converged yet — apply a corrective nudge. `err` is the
+            # magnitude error (|IMU| - |target|); we need motion along
+            # sign(target) to drive |IMU| toward |target|. Negate so positive
+            # err (|IMU| too big) pulls back toward zero.
+            target_sign = (
+                math.copysign(1.0, target_angle_deg) if target_angle_deg != 0 else 1.0
+            )
+            raw_correction = int(-err * target_sign * steps_per_deg * sign)
             correction_steps = max(
                 -max_single_correction_steps,
                 min(max_single_correction_steps, raw_correction),
