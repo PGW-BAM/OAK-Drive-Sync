@@ -185,6 +185,7 @@ class DriveManager:
                             probe_dir = 1 if full_delta_steps > 0 else -1
                             probe_target = drive.current_position + probe_mag * probe_dir
 
+                            probe_before_pos = drive.current_position
                             was_cal = drive.calibration_mode
                             drive.calibration_mode = True
                             try:
@@ -193,16 +194,69 @@ class DriveManager:
                             finally:
                                 drive.calibration_mode = was_cal
 
-                            try:
-                                post_imu = await self.drift_detector.request_imu_check(
-                                    cam_id, "handle_move:probe_verify"
+                            # Motion monitoring: if the motor didn't
+                            # advance at all, we're pinned at a physical
+                            # limit in this direction. Reverse the probe
+                            # and try the other way before giving up on
+                            # the coarse step.
+                            probe_advance = drive.current_position - probe_before_pos
+                            if abs(probe_advance) < 1.0:
+                                prev_sign = target_sign_val
+                                target_sign_val = -target_sign_val
+                                self.drift_detector.set_target_sign(
+                                    cam_id, target_sign_val, axis="b"
                                 )
-                            except TimeoutError:
-                                post_imu = None
                                 logger.warning(
-                                    "handle_move.probe_verify_imu_timeout",
+                                    "handle_move.probe_motor_stuck_reversing",
                                     cam_id=cam_id,
+                                    position=probe_before_pos,
+                                    requested_delta=probe_mag * probe_dir,
+                                    old_sign=prev_sign,
+                                    new_sign=target_sign_val,
                                 )
+                                probe_dir = -probe_dir
+                                probe_target = (
+                                    drive.current_position + probe_mag * probe_dir
+                                )
+                                probe_before_pos = drive.current_position
+                                was_cal = drive.calibration_mode
+                                drive.calibration_mode = True
+                                try:
+                                    await drive.move_to(probe_target, speed=speed)
+                                    await asyncio.sleep(self.settling_delay_ms / 1000.0)
+                                finally:
+                                    drive.calibration_mode = was_cal
+                                if abs(drive.current_position - probe_before_pos) < 1.0:
+                                    logger.error(
+                                        "handle_move.probe_stuck_both_directions",
+                                        cam_id=cam_id,
+                                        position=probe_before_pos,
+                                    )
+                                    # Fall through to converge; it has its
+                                    # own stuck detection and will fault out.
+                                    post_imu = None
+                                else:
+                                    try:
+                                        post_imu = await self.drift_detector.request_imu_check(
+                                            cam_id, "handle_move:probe_verify_rev"
+                                        )
+                                    except TimeoutError:
+                                        post_imu = None
+                                        logger.warning(
+                                            "handle_move.probe_verify_imu_timeout",
+                                            cam_id=cam_id,
+                                        )
+                            else:
+                                try:
+                                    post_imu = await self.drift_detector.request_imu_check(
+                                        cam_id, "handle_move:probe_verify"
+                                    )
+                                except TimeoutError:
+                                    post_imu = None
+                                    logger.warning(
+                                        "handle_move.probe_verify_imu_timeout",
+                                        cam_id=cam_id,
+                                    )
 
                             if post_imu is not None:
                                 post_angle = (
@@ -232,6 +286,7 @@ class DriveManager:
                                     err_after * spd * target_sign_val
                                 )
                                 final_target = drive.current_position + remaining_delta
+                                remaining_before_pos = drive.current_position
                                 was_cal = drive.calibration_mode
                                 drive.calibration_mode = True
                                 try:
@@ -239,6 +294,23 @@ class DriveManager:
                                     await asyncio.sleep(self.settling_delay_ms / 1000.0)
                                 finally:
                                     drive.calibration_mode = was_cal
+                                remaining_advance = (
+                                    drive.current_position - remaining_before_pos
+                                )
+                                if abs(remaining_delta) > 100 and abs(remaining_advance) < abs(
+                                    remaining_delta
+                                ) * 0.5:
+                                    logger.warning(
+                                        "drive.coarse_remaining_stalled",
+                                        key=key,
+                                        requested_delta=remaining_delta,
+                                        actual_advance=remaining_advance,
+                                        hint=(
+                                            "Motor stopped short of the coarse "
+                                            "target — likely hit a physical "
+                                            "limit. Converge will take over."
+                                        ),
+                                    )
                                 logger.info(
                                     "drive.coarse_move_guided",
                                     key=key,
@@ -246,6 +318,7 @@ class DriveManager:
                                     post_angle=round(post_angle, 3),
                                     target=round(float(target_angle_deg), 3),
                                     final_target=final_target,
+                                    actual_advance=remaining_advance,
                                     sign=target_sign_val,
                                 )
 
