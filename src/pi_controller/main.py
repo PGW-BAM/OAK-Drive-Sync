@@ -143,40 +143,111 @@ class DriveManager:
 
         try:
             if angle_driven:
-                # Angle-first. If startup auto-calibration discovered a
-                # reference_position + reference_angle_deg and fresh
-                # steps_per_degree, compute the coarse target from geometry:
-                #   coarse = ref_pos + (target - ref_angle) * spd * sign
-                # cam1 mounts upside-down so its reference_angle_deg is −90;
-                # cam2 is right-side-up so +90. Move there with envelope
-                # bypass before letting converge() fine-tune. If auto-cal
-                # hasn't produced a reference yet, skip the coarse step and
-                # fall through to pure converge from the current angle.
-                ref_pos = self.drift_detector.get_reference_position(cam_id, axis="b")
-                ref_angle = self.drift_detector.get_reference_angle_deg(cam_id, axis="b")
+                # Angle-first. Compute the coarse move from the CURRENT
+                # IMU angle rather than the stored reference_position:
+                # ref_pos may be stale (motor unpowered/moved between
+                # auto-cal and now, or auto-cal failed entirely), but
+                # "delta from the angle I can read right now" is always
+                # correct. Before committing the full move we take a
+                # short probe in the direction implied by target_sign_val
+                # and re-read the IMU — if the angle moved AWAY from the
+                # target, target_sign_val was wrong, so we flip it and
+                # persist the correction. This guarantees the first
+                # sizeable motion is toward the target angle.
                 spd = self.drift_detector.get_steps_per_degree(cam_id)
                 target_sign_val = self.drift_detector.get_target_sign(cam_id, axis="b")
 
-                if ref_pos is not None and ref_angle is not None and spd > 0.0:
-                    coarse_target = (
-                        ref_pos
-                        + (float(target_angle_deg) - ref_angle) * spd * target_sign_val
-                    )
-                    was_cal = drive.calibration_mode
-                    drive.calibration_mode = True
+                if spd > 0.0:
                     try:
-                        await drive.move_to(coarse_target, speed=speed)
-                        await asyncio.sleep(self.settling_delay_ms / 1000.0)
-                    finally:
-                        drive.calibration_mode = was_cal
-                    logger.info(
-                        "drive.coarse_move_from_reference",
-                        key=key,
-                        reference_position=ref_pos,
-                        reference_angle_deg=ref_angle,
-                        target_angle_deg=target_angle_deg,
-                        coarse_target=coarse_target,
-                    )
+                        pre_imu = await self.drift_detector.request_imu_check(
+                            cam_id, "handle_move:pre_coarse"
+                        )
+                    except TimeoutError:
+                        pre_imu = None
+                        logger.warning(
+                            "handle_move.pre_coarse_imu_timeout", cam_id=cam_id
+                        )
+
+                    if pre_imu is not None:
+                        pre_angle = (
+                            pre_imu.roll_deg
+                            if active_angle == "roll"
+                            else pre_imu.pitch_deg
+                        )
+                        err_before = float(target_angle_deg) - pre_angle
+                        full_delta_steps = int(err_before * spd * target_sign_val)
+
+                        # Only bother with a coarse move if there's a
+                        # meaningful error. Below ~1° converge handles it
+                        # directly with a small correction.
+                        if abs(full_delta_steps) >= 100:
+                            probe_mag = max(200, min(500, abs(full_delta_steps) // 10))
+                            probe_dir = 1 if full_delta_steps > 0 else -1
+                            probe_target = drive.current_position + probe_mag * probe_dir
+
+                            was_cal = drive.calibration_mode
+                            drive.calibration_mode = True
+                            try:
+                                await drive.move_to(probe_target, speed=speed)
+                                await asyncio.sleep(self.settling_delay_ms / 1000.0)
+                            finally:
+                                drive.calibration_mode = was_cal
+
+                            try:
+                                post_imu = await self.drift_detector.request_imu_check(
+                                    cam_id, "handle_move:probe_verify"
+                                )
+                            except TimeoutError:
+                                post_imu = None
+                                logger.warning(
+                                    "handle_move.probe_verify_imu_timeout",
+                                    cam_id=cam_id,
+                                )
+
+                            if post_imu is not None:
+                                post_angle = (
+                                    post_imu.roll_deg
+                                    if active_angle == "roll"
+                                    else post_imu.pitch_deg
+                                )
+                                err_after = float(target_angle_deg) - post_angle
+
+                                if abs(err_after) > abs(err_before):
+                                    prev_sign = target_sign_val
+                                    target_sign_val = -target_sign_val
+                                    self.drift_detector.set_target_sign(
+                                        cam_id, target_sign_val, axis="b"
+                                    )
+                                    logger.warning(
+                                        "handle_move.probe_direction_flip",
+                                        cam_id=cam_id,
+                                        pre_angle=round(pre_angle, 3),
+                                        post_angle=round(post_angle, 3),
+                                        target=round(float(target_angle_deg), 3),
+                                        old_sign=prev_sign,
+                                        new_sign=target_sign_val,
+                                    )
+
+                                remaining_delta = int(
+                                    err_after * spd * target_sign_val
+                                )
+                                final_target = drive.current_position + remaining_delta
+                                was_cal = drive.calibration_mode
+                                drive.calibration_mode = True
+                                try:
+                                    await drive.move_to(final_target, speed=speed)
+                                    await asyncio.sleep(self.settling_delay_ms / 1000.0)
+                                finally:
+                                    drive.calibration_mode = was_cal
+                                logger.info(
+                                    "drive.coarse_move_guided",
+                                    key=key,
+                                    pre_angle=round(pre_angle, 3),
+                                    post_angle=round(post_angle, 3),
+                                    target=round(float(target_angle_deg), 3),
+                                    final_target=final_target,
+                                    sign=target_sign_val,
+                                )
 
                 result = await self.drift_detector.converge(
                     cam_id,
