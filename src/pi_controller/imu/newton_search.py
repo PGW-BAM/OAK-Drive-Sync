@@ -95,6 +95,8 @@ async def newton_angle_search(
     log_prefix: str = "newton",
     on_direction_sign_change: Callable[[int], None] | None = None,
     allow_direction_flip: bool = True,
+    stuck_tolerance: int = 1,
+    regression_tolerance: int = 1,
 ) -> NewtonResult:
     """Drive `drive` so the IMU reads `target_angle_deg` within `threshold_deg`.
 
@@ -106,11 +108,18 @@ async def newton_angle_search(
     — appropriate for manual moves that may legitimately traverse the full
     calibrated envelope.
     `allow_direction_flip=False` treats any err-regression or angle-stuck as
-    an immediate abort (no direction flip). Use this for manual moves where
+    an abort condition (no direction flip). Use this for manual moves where
     direction is known from auto-cal — a stuck iteration then means the
     drive hit a physical end-stop and must not keep pushing in the wrong
     direction. Auto-cal leaves this True to auto-recover from a bad Phase 1
     probe.
+
+    `stuck_tolerance` / `regression_tolerance` require N *consecutive*
+    violations before aborting. Only meaningful when `allow_direction_flip`
+    is False — auto-cal flips direction on the first bad iteration. For
+    manual moves, settling noise and a tight threshold_deg relative to IMU
+    noise can cause false-positive stuck/regression on a single iteration;
+    tolerance > 1 lets the loop keep searching through transients.
     """
 
     min_response_deg = 0.2
@@ -124,6 +133,8 @@ async def newton_angle_search(
     prev_err_sign: int = 0
     prev_delta_steps: int = 0
     flipped = False
+    stuck_streak = 0
+    regression_streak = 0
 
     iterations = 0
     angle: float | None = None
@@ -195,6 +206,8 @@ async def newton_angle_search(
             angle_stuck = angle_delta < min_response_deg
 
             if err_grew:
+                regression_streak += 1
+                stuck_streak = 0
                 if allow_direction_flip and not flipped:
                     old_dir = direction_sign
                     direction_sign = -direction_sign
@@ -212,8 +225,25 @@ async def newton_angle_search(
                         old_direction_sign=old_dir,
                         new_direction_sign=direction_sign,
                     )
+                elif (
+                    not allow_direction_flip
+                    and regression_streak < regression_tolerance
+                ):
+                    # Manual mode: tolerate transient regression (IMU noise or
+                    # residual settling from the previous step). Keep searching.
+                    logger.info(
+                        f"{log_prefix}.err_regression_tolerated",
+                        cam_id=cam_id,
+                        streak=regression_streak,
+                        tolerance=regression_tolerance,
+                        prev_abs_err=round(prev_abs_err, 3),
+                        current_abs_err=round(abs(err), 3),
+                        prev_delta_steps=prev_delta_steps,
+                        angle_delta=round(angle_delta, 3),
+                    )
                 else:
-                    # Either flipped already or flips disabled (manual mode).
+                    # Either flipped already or flips disabled and streak
+                    # exceeded tolerance (persistent wrong-direction motion).
                     err_code = (
                         "both_directions_err_regression"
                         if allow_direction_flip
@@ -224,6 +254,8 @@ async def newton_angle_search(
                         cam_id=cam_id,
                         allow_direction_flip=allow_direction_flip,
                         flipped=flipped,
+                        regression_streak=regression_streak,
+                        regression_tolerance=regression_tolerance,
                         current_position=drive.current_position,
                         start_pos=start_pos,
                         current_angle=round(angle, 3),
@@ -246,11 +278,15 @@ async def newton_angle_search(
                         est_spd=est_spd,
                     )
             elif angle_stuck:
+                stuck_streak += 1
+                regression_streak = 0
                 logger.warning(
                     f"{log_prefix}.angle_stuck",
                     cam_id=cam_id,
                     allow_direction_flip=allow_direction_flip,
                     flipped=flipped,
+                    stuck_streak=stuck_streak,
+                    stuck_tolerance=stuck_tolerance,
                     prev_delta_steps=prev_delta_steps,
                     angle_delta=round(angle_delta, 3),
                     current_abs_err=round(abs(err), 3),
@@ -280,12 +316,31 @@ async def newton_angle_search(
                     prev_abs_err = None
                     prev_err_sign = 0
                     prev_delta_steps = 0
+                    stuck_streak = 0
+                    regression_streak = 0
                     continue
+                elif (
+                    not allow_direction_flip
+                    and stuck_streak < stuck_tolerance
+                ):
+                    # Manual mode: tolerate transient stuck (IMU still
+                    # settling, small correction below noise floor). Keep
+                    # searching — the main loop will take another Newton
+                    # step below.
+                    logger.info(
+                        f"{log_prefix}.angle_stuck_tolerated",
+                        cam_id=cam_id,
+                        streak=stuck_streak,
+                        tolerance=stuck_tolerance,
+                        prev_delta_steps=prev_delta_steps,
+                        angle_delta=round(angle_delta, 3),
+                        current_abs_err=round(abs(err), 3),
+                    )
                 else:
-                    # Flips disabled (manual mode, direction known from
-                    # auto-cal) OR already flipped once. Motor pushed but
-                    # IMU didn't respond → physical end stop. Back off and
-                    # abort; pressing further would grind the hardware.
+                    # Flips disabled and streak exceeded tolerance (persistent
+                    # no-response → physical end stop), OR already flipped
+                    # once. Back off and abort; pressing further grinds the
+                    # hardware.
                     err_code = (
                         "both_directions_angle_stuck"
                         if allow_direction_flip
@@ -296,6 +351,8 @@ async def newton_angle_search(
                         cam_id=cam_id,
                         allow_direction_flip=allow_direction_flip,
                         flipped=flipped,
+                        stuck_streak=stuck_streak,
+                        stuck_tolerance=stuck_tolerance,
                         current_position=drive.current_position,
                         start_pos=start_pos,
                         travel_from_start=drive.current_position - start_pos,
@@ -318,6 +375,11 @@ async def newton_angle_search(
                         direction_sign=direction_sign,
                         est_spd=est_spd,
                     )
+            else:
+                # Clean iteration — substantive move produced a
+                # substantive, non-regressing response. Reset streaks.
+                stuck_streak = 0
+                regression_streak = 0
 
         # ── Convergence check ───────────────────────────────────────────
         if abs(err) <= threshold_deg:

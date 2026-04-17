@@ -290,6 +290,10 @@ class DriftDetector:
         settle_speed: float = float(conv.get("settle_speed", 0.3))
         seed_speed: float = float(conv.get("seed_speed", 0.8))
         settle_ms: int = int(conv.get("settle_ms", 400))
+        manual_stuck_tolerance: int = int(conv.get("manual_stuck_tolerance", 4))
+        manual_regression_tolerance: int = int(
+            conv.get("manual_regression_tolerance", 3)
+        )
         sign_map: dict = conv.get("steps_per_degree_sign", {}) or {}
         direction_sign: int = int(sign_map.get(f"{cam_id}_b", 1))
 
@@ -400,8 +404,13 @@ class DriftDetector:
                 on_direction_sign_change=_on_sign_change,
                 # Direction is known from auto-cal; a stuck iteration means
                 # we hit a physical end-stop, so abort instead of flipping
-                # and grinding the wrong way.
+                # and grinding the wrong way. Require several consecutive
+                # stuck/regression iterations before aborting so IMU
+                # settling noise and sub-noise corrections near target
+                # don't bail out after one bad sample.
                 allow_direction_flip=False,
+                stuck_tolerance=manual_stuck_tolerance,
+                regression_tolerance=manual_regression_tolerance,
             )
 
             # Translate NewtonResult → ConvergeResult + DriftDetectionEvent.
