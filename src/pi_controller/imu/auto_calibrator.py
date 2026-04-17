@@ -320,7 +320,14 @@ async def auto_calibrate(
         # signal of physical motion.
         min_response_deg = 0.2
         regression_threshold_deg = max(ref_threshold_deg, motion_threshold_deg)
-        spd_smoothing = 0.5  # 0 = trust new measurement fully, 1 = never update
+        # Low smoothing (close to 0) trusts the freshly-measured steps-per-degree
+        # quickly. Phase 1's probe response is often 2-5× smaller than the true
+        # motion amplitude (the probe may be partly in the backlash zone), so the
+        # initial est_spd can be 5-10× too high. With 0.5 smoothing it takes 7+
+        # iterations to halve the error; with 0.1 it takes 2, preventing repeated
+        # max_step_per_iter-clamped overshoots that can walk the camera into a
+        # physical end-stop, trigger angle_stuck, and flip direction.
+        spd_smoothing = 0.1  # was 0.5 — converge est_spd to measured value quickly
         spd_min = 1.0        # clamp so we never divide by ~zero
         prev_angle: float | None = None
         prev_abs_err: float | None = None

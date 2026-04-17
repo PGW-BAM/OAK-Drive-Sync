@@ -61,7 +61,12 @@ auto_calibration:
   reference_threshold_deg: 0.5 # Phase 2 convergence to |angle − ref| <= this
   motion_threshold_deg: 0.2   # Phase 1/3 minimum detectable angle change
   max_iterations: 30          # Phase 2 Newton-search budget
-  max_step_per_iter: 1000     # per-iteration clamp
+  max_step_per_iter: 400      # per-iteration clamp — halved from 1000 to limit
+                              # overshoot into physical end-stops. At ~100 steps/
+                              # degree this caps each correction at 4°; the camera
+                              # still reaches a 46°-away target in ~12 iterations
+                              # (within max_iterations:30) while never overshooting
+                              # more than 4° past the target.
   safety_travel: 8000         # abort Phase 2 if drive drifts this far from start
   settle_speed: 0.3           # slow: gentler stop → cleaner post-move IMU reading.
                               # Kept at 0.3 because below that the motor can
@@ -96,4 +101,5 @@ convergence:
   settle_speed: 0.3
   steps_per_degree_sign:
     cam1_b: 1     # flip to -1 if a positive step decreases the IMU angle
-    cam2_b: 1
+    cam2_b: -1    # confirmed from issue #7 probe: +200 steps → −0.882° (delta<0)
+                  # positive motor steps make cam2 MORE negative → direction = -1
