@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Literal
 import structlog
 import yaml
 
+from src.pi_controller.imu.angle_history import AngleHistory
+from src.pi_controller.imu.newton_search import newton_angle_search
 from src.shared.models import DriftDetectionEvent, IMUAngle, IMUCheckRequest
 from src.shared.mqtt_topics import CMD_IMU_CHECK, EVENT_DRIFT, topic
 
@@ -55,6 +57,11 @@ class DriftDetector:
         self._calibration: dict = self._load_calibration()
         self._latest_imu: dict[str, IMUAngle] = {}   # cam_id → most recent IMUAngle
         self._pending: dict[str, asyncio.Future] = {} # request_id → Future[IMUAngle]
+        # Per-cam (target_angle → motor_position) cache so repeat visits to
+        # the same angle only need small-step corrections.
+        self.angle_history = AngleHistory(
+            self._calibration, self._save_calibration
+        )
 
     # ──────────────────────────────────────────────
     # MQTT message handler (registered as subscriber)
@@ -260,23 +267,31 @@ class DriftDetector:
         checkpoint_name: str = "",
         resync_position: float | None = None,
     ) -> ConvergeResult:
-        """Iterative nudge-and-settle until |measured - target| <= threshold.
+        """Seed-then-Newton closed-loop angle converge.
 
-        After a successful converge, if `resync_position` is supplied the drive's
-        internal position counter is overwritten (no motion) so cumulative nudges
-        don't permanently offset the min/max envelope.
+        Delegates the inner search to `newton_angle_search`, the same helper
+        used by the startup auto-calibrator's Phase 2 — adaptive est_spd EMA,
+        small ~4° clamps, crossover detection, and stuck/wrong-direction
+        recovery. Before the Newton loop we seed the drive open-loop to a
+        best-guess position (history hit → stored; else reference-anchor
+        formula). On a successful converge we record the final position so
+        the next visit to this angle gets a close-to-correct seed.
 
-        One DriftDetectionEvent is published on the terminal iteration (either
-        convergence or max-iteration exhaustion). Per-iteration progress goes to
-        structlog only.
+        `resync_position` behavior is unchanged: overwrites the drive's
+        internal counter after a successful converge.
+
+        One DriftDetectionEvent is published on the terminal iteration.
         """
         conv = self._calibration.get("convergence", {}) or {}
-        max_iterations: int = int(conv.get("max_iterations", 20))
-        max_correction_deg: float = float(conv.get("max_correction_deg", 20.0))
+        max_iterations: int = int(conv.get("max_iterations", 30))
+        max_step_per_iter: int = int(conv.get("max_step_per_iter", 400))
+        motion_threshold_deg: float = float(conv.get("motion_threshold_deg", 0.2))
         threshold_deg: float = float(conv.get("threshold_deg", 0.3))
         settle_speed: float = float(conv.get("settle_speed", 0.3))
+        seed_speed: float = float(conv.get("seed_speed", 0.8))
+        settle_ms: int = int(conv.get("settle_ms", 400))
         sign_map: dict = conv.get("steps_per_degree_sign", {}) or {}
-        sign: int = int(sign_map.get(f"{cam_id}_b", 1))
+        direction_sign: int = int(sign_map.get(f"{cam_id}_b", 1))
 
         steps_per_deg = self.get_steps_per_degree(cam_id)
         if steps_per_deg == 0.0:
@@ -293,37 +308,54 @@ class DriftDetector:
                 event=None,
             )
 
-        max_single_correction_steps = int(max_correction_deg * steps_per_deg)
-        last_request_id = ""
-        last_actual = 0.0
-        err = float("nan")
-        total_correction_steps = 0
-        # Motion monitoring: if we command a non-zero correction but the
-        # motor doesn't advance (soft envelope clamp OR physical end-stop),
-        # flip target_sign_val and try the other direction once. If the
-        # drive is still stuck after the reversal, abort with a fault.
-        reversed_due_to_stuck = False
-        # Minimum per-iteration angle change we expect from a meaningful
-        # correction; below this we treat the response as "no motion".
-        min_response_deg = 0.2
-        prev_angle: float | None = None
-        prev_correction_steps = 0
-        # Err-regression monitoring: if the motor moved (angle changed) but
-        # |err| grew after a substantive correction, our sign is wrong —
-        # we corrected in the direction that made things worse. Flip once
-        # and keep iterating.
-        prev_abs_err: float | None = None
+        reference_position = self.get_reference_position(cam_id, axis="b")
+        reference_angle_deg = self.get_reference_angle_deg(cam_id, axis="b")
 
-        # Bypass the drive's soft min/max envelope while iterating so the
-        # closed-loop controller can always move toward the IMU target, even
-        # when restart-drift has left the motor counter far outside the
-        # envelope. Stuck-drive detection (below) still catches physically
-        # unreachable cases; successful resync_position re-anchors the counter
-        # to a known-good value afterward.
+        # Bypass the soft envelope — see original comment. Also lets the
+        # seed pre-move land wherever the last visit to this angle parked.
         was_cal_mode = drive.calibration_mode
         drive.calibration_mode = True
         try:
-            for i in range(1, max_iterations + 1):
+            # ── Seed phase ──────────────────────────────────────────────
+            # Open-loop pre-move to a best-guess position before the Newton
+            # loop. Saves many iterations and, more importantly, keeps the
+            # first Newton step small — no more "goes totally wrong way"
+            # when the current position is 40° off target.
+            seed = self.angle_history.seed_for(
+                cam_id=cam_id,
+                target_angle_deg=target_angle_deg,
+                reference_position=(
+                    int(reference_position) if reference_position is not None else None
+                ),
+                reference_angle_deg=reference_angle_deg,
+                steps_per_degree=steps_per_deg,
+                direction_sign=direction_sign,
+            )
+            if seed is not None:
+                pre_pos = drive.current_position
+                if abs(seed - pre_pos) >= max(1, int(steps_per_deg * motion_threshold_deg)):
+                    try:
+                        await drive.move_to(seed, speed=seed_speed)
+                        if settle_ms > 0:
+                            await asyncio.sleep(settle_ms / 1000.0)
+                        logger.info(
+                            "drift_detector.converge_seed_move",
+                            cam_id=cam_id,
+                            target_angle_deg=target_angle_deg,
+                            pre_pos=pre_pos,
+                            seed_pos=seed,
+                            travel=seed - pre_pos,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "drift_detector.converge_seed_move_failed",
+                            cam_id=cam_id,
+                            seed_pos=seed,
+                        )
+            start_pos = drive.current_position
+
+            # ── Newton fine-tune ────────────────────────────────────────
+            async def _read(label: str) -> float | None:
                 try:
                     imu = await self.request_imu_check(
                         cam_id,
@@ -333,270 +365,104 @@ class DriftDetector:
                     logger.error(
                         "drift_detector.converge_imu_timeout",
                         cam_id=cam_id,
-                        iteration=i,
+                        label=label,
                         error=str(exc),
                     )
-                    event = await self._publish_converge_event(
-                        cam_id=cam_id,
-                        checkpoint_name=checkpoint_name,
-                        request_id=last_request_id,
-                        expected=target_angle_deg,
-                        actual=last_actual,
-                        drift=err,
-                        correction_steps=total_correction_steps,
-                        corrected=False,
-                        iterations=i,
-                        resynced_to=None,
-                    )
-                    return ConvergeResult(
-                        converged=False,
-                        iterations=i,
-                        final_error_deg=err,
-                        resynced_to=None,
-                        event=event,
-                    )
-
+                    return None
+                val = imu.roll_deg if active_angle == "roll" else imu.pitch_deg
+                nonlocal last_request_id, last_actual
                 last_request_id = imu.request_id or ""
-                last_actual = imu.roll_deg if active_angle == "roll" else imu.pitch_deg
+                last_actual = val
+                return val
 
-                # Motion monitoring: did the PREVIOUS iteration's commanded
-                # move actually change the camera angle? If we commanded a
-                # correction worth more than `min_response_deg` but the
-                # angle barely moved, the drive is at a physical end-stop
-                # (the motor position may have inched but the camera can't
-                # rotate). Reverse direction once; if the next iteration
-                # still can't move the angle, the motor-position stuck
-                # detection below will abort.
-                if prev_angle is not None and abs(prev_correction_steps) >= max(
-                    1, int(steps_per_deg * min_response_deg * 2)
-                ):
-                    angle_delta = abs(last_actual - prev_angle)
-                    if angle_delta < min_response_deg and not reversed_due_to_stuck:
-                        old_sign = sign
-                        sign = -sign
-                        self.set_target_sign(cam_id, sign, axis="b")
-                        reversed_due_to_stuck = True
-                        logger.warning(
-                            "drift_detector.converge_angle_stuck_reversing",
+            last_request_id = ""
+            last_actual = 0.0
+
+            def _on_sign_change(new_sign: int) -> None:
+                self.set_target_sign(cam_id, new_sign, axis="b")
+
+            newton = await newton_angle_search(
+                cam_id=cam_id,
+                drive=drive,
+                read_angle=_read,
+                target_angle_deg=target_angle_deg,
+                threshold_deg=threshold_deg,
+                motion_threshold_deg=motion_threshold_deg,
+                max_iterations=max_iterations,
+                max_step_per_iter=max_step_per_iter,
+                est_spd_init=steps_per_deg,
+                direction_sign=direction_sign,
+                settle_speed=settle_speed,
+                settle_ms=settle_ms,
+                safety_travel=None,   # manual moves may span full envelope
+                start_pos=int(start_pos),
+                log_prefix="drift_detector.converge",
+                on_direction_sign_change=_on_sign_change,
+                # Direction is known from auto-cal; a stuck iteration means
+                # we hit a physical end-stop, so abort instead of flipping
+                # and grinding the wrong way.
+                allow_direction_flip=False,
+            )
+
+            # Translate NewtonResult → ConvergeResult + DriftDetectionEvent.
+            err = float(newton.final_err) if newton.final_err is not None else float("nan")
+            total_correction_steps = int(drive.current_position - start_pos)
+
+            if newton.converged:
+                resynced: float | None = None
+                if resync_position is not None:
+                    try:
+                        drive.set_current_position(resync_position)
+                        resynced = resync_position
+                    except Exception:
+                        logger.exception(
+                            "drift_detector.converge_resync_failed",
                             cam_id=cam_id,
-                            iteration=i,
-                            prev_angle=round(prev_angle, 3),
-                            current_angle=round(last_actual, 3),
-                            prev_correction_steps=prev_correction_steps,
-                            old_sign=old_sign,
-                            new_sign=sign,
-                            hint=(
-                                "Camera angle didn't respond to last correction — "
-                                "likely hit a physical limit. Flipping direction."
-                            ),
+                            resync_position=resync_position,
                         )
-
-                # Magnitude-based error: compare |IMU| vs |target| so that cam2's
-                # flipped mounting (target is negative of cam1's value for the same
-                # physical orientation) converges identically. Positive err means
-                # |IMU| is too large and we must move toward zero; negative err means
-                # |IMU| is too small and we must move away from zero in the direction
-                # of sign(target).
-                err = abs(last_actual) - abs(target_angle_deg)
-
-                logger.info(
-                    "drift_detector.converge_iteration",
-                    cam_id=cam_id,
-                    iteration=i,
-                    active_angle=active_angle,
-                    target_deg=round(target_angle_deg, 3),
-                    actual_deg=round(last_actual, 3),
-                    abs_target_deg=round(abs(target_angle_deg), 3),
-                    abs_actual_deg=round(abs(last_actual), 3),
-                    error_deg=round(err, 3),
-                    threshold_deg=threshold_deg,
-                )
-
-                # Err-regression check: if the previous correction was
-                # substantive (≥ threshold_deg worth of steps) AND |err| grew
-                # by more than threshold_deg, we corrected in the wrong
-                # direction. Flip sign once and let the next iteration
-                # re-attempt with the corrected sign.
-                if (
-                    prev_abs_err is not None
-                    and not reversed_due_to_stuck
-                    and abs(prev_correction_steps)
-                    >= max(1, int(steps_per_deg * threshold_deg))
-                    and abs(err) > prev_abs_err + threshold_deg
-                ):
-                    old_sign = sign
-                    sign = -sign
-                    self.set_target_sign(cam_id, sign, axis="b")
-                    reversed_due_to_stuck = True
-                    logger.warning(
-                        "drift_detector.converge_err_regression_reversing",
-                        cam_id=cam_id,
-                        iteration=i,
-                        prev_abs_err=round(prev_abs_err, 3),
-                        current_abs_err=round(abs(err), 3),
-                        prev_correction_steps=prev_correction_steps,
-                        old_sign=old_sign,
-                        new_sign=sign,
-                        hint=(
-                            "Previous correction grew the error — sign was "
-                            "wrong. Flipping direction."
-                        ),
-                    )
-
-                if abs(err) <= threshold_deg:
-                    resynced: float | None = None
-                    if resync_position is not None:
-                        try:
-                            drive.set_current_position(resync_position)
-                            resynced = resync_position
-                        except Exception:
-                            logger.exception(
-                                "drift_detector.converge_resync_failed",
-                                cam_id=cam_id,
-                                resync_position=resync_position,
-                            )
-                    event = await self._publish_converge_event(
-                        cam_id=cam_id,
-                        checkpoint_name=checkpoint_name,
-                        request_id=last_request_id,
-                        expected=target_angle_deg,
-                        actual=last_actual,
-                        drift=err,
-                        correction_steps=total_correction_steps,
-                        corrected=True,
-                        iterations=i,
-                        resynced_to=resynced,
-                    )
-                    return ConvergeResult(
-                        converged=True,
-                        iterations=i,
-                        final_error_deg=err,
-                        resynced_to=resynced,
-                        event=event,
-                    )
-
-                # Not converged yet — apply a corrective nudge. `err` is the
-                # magnitude error (|IMU| - |target|); we need motion along
-                # sign(target) to drive |IMU| toward |target|. Negate so positive
-                # err (|IMU| too big) pulls back toward zero.
-                target_sign = (
-                    math.copysign(1.0, target_angle_deg) if target_angle_deg != 0 else 1.0
-                )
-                raw_correction = int(-err * target_sign * steps_per_deg * sign)
-                correction_steps = max(
-                    -max_single_correction_steps,
-                    min(max_single_correction_steps, raw_correction),
-                )
-                if abs(raw_correction) > max_single_correction_steps:
-                    logger.critical(
-                        "drift_detector.converge_correction_clamped",
-                        cam_id=cam_id,
-                        iteration=i,
-                        raw_correction=raw_correction,
-                        clamped_to=correction_steps,
-                        error_deg=round(err, 3),
-                    )
-
-                new_position = drive.current_position + correction_steps
-                before_pos = drive.current_position
+                # Record pre-resync motor position under the target-angle
+                # bucket. If resync ran, the recorded value is the pre-
+                # resync position (before the counter was overwritten); the
+                # seed formula uses absolute counter values so recording
+                # post-resync would poison the cache on next boot.
                 try:
-                    await drive.move_to(new_position, speed=settle_speed)
-                    total_correction_steps += correction_steps
+                    self.angle_history.record(
+                        cam_id=cam_id,
+                        target_angle_deg=target_angle_deg,
+                        position=int(newton.final_position),
+                    )
                 except Exception:
                     logger.exception(
-                        "drift_detector.converge_move_failed",
+                        "drift_detector.converge_history_record_failed",
                         cam_id=cam_id,
-                        iteration=i,
-                        new_position=new_position,
                     )
-                    event = await self._publish_converge_event(
-                        cam_id=cam_id,
-                        checkpoint_name=checkpoint_name,
-                        request_id=last_request_id,
-                        expected=target_angle_deg,
-                        actual=last_actual,
-                        drift=err,
-                        correction_steps=total_correction_steps,
-                        corrected=False,
-                        iterations=i,
-                        resynced_to=None,
-                    )
-                    return ConvergeResult(
-                        converged=False,
-                        iterations=i,
-                        final_error_deg=err,
-                        resynced_to=None,
-                        event=event,
-                    )
+                event = await self._publish_converge_event(
+                    cam_id=cam_id,
+                    checkpoint_name=checkpoint_name,
+                    request_id=last_request_id,
+                    expected=target_angle_deg,
+                    actual=last_actual,
+                    drift=err,
+                    correction_steps=total_correction_steps,
+                    corrected=True,
+                    iterations=newton.iterations,
+                    resynced_to=resynced,
+                )
+                return ConvergeResult(
+                    converged=True,
+                    iterations=newton.iterations,
+                    final_error_deg=err,
+                    resynced_to=resynced,
+                    event=event,
+                )
 
-                # Motion monitoring (motor position): if we commanded a
-                # non-zero move but the drive didn't advance at all, we're
-                # clamped at the envelope or pinned at a physical end-stop.
-                # On the first such event, reverse direction and let the
-                # next iteration try the opposite way (in case sign was
-                # wrong). On the second, give up with a fault.
-                after_pos = drive.current_position
-                if correction_steps != 0 and abs(after_pos - before_pos) < 1.0:
-                    if not reversed_due_to_stuck:
-                        old_sign = sign
-                        sign = -sign
-                        self.set_target_sign(cam_id, sign, axis="b")
-                        reversed_due_to_stuck = True
-                        logger.warning(
-                            "drift_detector.converge_motor_stuck_reversing",
-                            cam_id=cam_id,
-                            iteration=i,
-                            position=before_pos,
-                            requested_delta=correction_steps,
-                            old_sign=old_sign,
-                            new_sign=sign,
-                            hint=(
-                                "Motor didn't advance — flipping target_sign and "
-                                "retrying in the opposite direction."
-                            ),
-                        )
-                        prev_angle = last_actual
-                        prev_correction_steps = correction_steps
-                        prev_abs_err = abs(err)
-                        continue
-                    logger.error(
-                        "drift_detector.converge_drive_stuck_both_directions",
-                        cam_id=cam_id,
-                        iteration=i,
-                        position=before_pos,
-                        requested_delta=correction_steps,
-                        hint=(
-                            "Drive didn't move in either direction. Check "
-                            "calibrated min/max, current position, physical "
-                            "coupling, and the angle range available at this "
-                            "mounting."
-                        ),
-                    )
-                    event = await self._publish_converge_event(
-                        cam_id=cam_id,
-                        checkpoint_name=checkpoint_name,
-                        request_id=last_request_id,
-                        expected=target_angle_deg,
-                        actual=last_actual,
-                        drift=err,
-                        correction_steps=total_correction_steps,
-                        corrected=False,
-                        iterations=i,
-                        resynced_to=None,
-                    )
-                    return ConvergeResult(
-                        converged=False,
-                        iterations=i,
-                        final_error_deg=err,
-                        resynced_to=None,
-                        event=event,
-                    )
-
-                prev_angle = last_actual
-                prev_correction_steps = correction_steps
-                prev_abs_err = abs(err)
-
-            # Max iterations exhausted without convergence.
+            logger.warning(
+                "drift_detector.converge_failed",
+                cam_id=cam_id,
+                error=newton.error,
+                iterations=newton.iterations,
+                final_error_deg=round(err, 3) if not math.isnan(err) else None,
+            )
             event = await self._publish_converge_event(
                 cam_id=cam_id,
                 checkpoint_name=checkpoint_name,
@@ -606,18 +472,12 @@ class DriftDetector:
                 drift=err,
                 correction_steps=total_correction_steps,
                 corrected=False,
-                iterations=max_iterations,
+                iterations=newton.iterations,
                 resynced_to=None,
-            )
-            logger.warning(
-                "drift_detector.converge_exhausted",
-                cam_id=cam_id,
-                max_iterations=max_iterations,
-                final_error_deg=round(err, 3),
             )
             return ConvergeResult(
                 converged=False,
-                iterations=max_iterations,
+                iterations=newton.iterations,
                 final_error_deg=err,
                 resynced_to=None,
                 event=event,

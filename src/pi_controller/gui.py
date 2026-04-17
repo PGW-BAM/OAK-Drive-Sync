@@ -303,6 +303,12 @@ def setup_gui(
                         drive_cards[key]["position"] = ui.label(
                             f"Position: {drive.current_position:.1f}"
                         )
+                        # Live IMU angle (only for Tinkerforge radial drives — the
+                        # linear :a axes don't have a meaningful tilt reading).
+                        if key.endswith(":b") and drift_detector is not None:
+                            drive_cards[key]["angle"] = ui.label("Angle: —").classes(
+                                "text-indigo-700 font-semibold"
+                            )
                         drive_cards[key]["range"] = ui.label(
                             f"Range: {drive.get_min_position():.0f} – {drive.get_max_position():.0f}"
                         )
@@ -323,6 +329,16 @@ def setup_gui(
                     cards = drive_cards[key]
                     cards["state"].text = f"State: {drive.state.value}"
                     cards["position"].text = f"Position: {drive.current_position:.1f}"
+                    if "angle" in cards and drift_detector is not None:
+                        cam_id = key.split(":", 1)[0]
+                        imu = drift_detector.get_latest_imu(cam_id)
+                        if imu is not None:
+                            cards["angle"].text = (
+                                f"Angle: roll {imu.roll_deg:+.2f}°  "
+                                f"pitch {imu.pitch_deg:+.2f}°"
+                            )
+                        else:
+                            cards["angle"].text = "Angle: — (no IMU)"
 
                     if drive.calibrated:
                         cards["cal"].text = "CALIBRATED"
@@ -953,6 +969,27 @@ def setup_gui(
                         f"Max: {drive.get_max_position():.0f}" if drive.max_calibrated else "Max: —"
                     ).classes("text-orange-700 font-bold w-28")
                     range_label = ui.label("").classes("text-purple-700 w-32")
+
+                    # Live IMU angle for Tinkerforge radial drives — lets the
+                    # operator watch the camera tilt in real time while jogging.
+                    angle_label = None
+                    if key.endswith(":b") and drift_detector is not None:
+                        angle_label = ui.label("Angle: —").classes(
+                            "text-indigo-700 font-bold w-64"
+                        )
+
+                        def update_cal_angle(al=angle_label, k=key):
+                            cid = k.split(":", 1)[0]
+                            imu = drift_detector.get_latest_imu(cid)
+                            if imu is not None:
+                                al.text = (
+                                    f"Angle: roll {imu.roll_deg:+.2f}°  "
+                                    f"pitch {imu.pitch_deg:+.2f}°"
+                                )
+                            else:
+                                al.text = "Angle: — (no IMU)"
+
+                        ui.timer(0.3, update_cal_angle)
 
                 # Jog controls — order: -1000 -500 -100 -50 -10 -1 | +1 +10 +50 +100 +500 +1000
                 with ui.row().classes("items-center gap-2 mt-1"):

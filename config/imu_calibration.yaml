@@ -95,11 +95,31 @@ auto_calibration:
 # resync_position from the MoveCommand so cumulative nudges don't drift the
 # soft min/max envelope.
 convergence:
-  max_iterations: 20              # bounded iteration budget per converge call
-  max_correction_deg: 20.0        # per-iteration travel cap, in degrees
-  threshold_deg: 0.3
-  settle_speed: 0.3
+  max_iterations: 30                  # raised from 20 to match auto-cal budget
+  max_step_per_iter: 400              # per-iteration motor-step clamp (~4°);
+                                      # replaces max_correction_deg:20° to kill
+                                      # the manual-angle overshoot (2400 steps
+                                      # → 4° in one shot is too violent).
+  motion_threshold_deg: 0.2           # min IMU response to treat as "motor moved"
+  threshold_deg: 0.3                  # convergence window
+  settle_speed: 0.3                   # Tinkerforge velocity during Newton steps
+  seed_speed: 0.8                     # open-loop pre-move speed when seeding
+                                      # from angle_history (coarse → fast).
+  stale_seed_tolerance_steps: 2000    # after auto-cal rediscovers reference_position,
+                                      # drop history entries further than this from
+                                      # the new formula-derived position.
+  settle_ms: 400                      # wait between motor move and IMU sample
   steps_per_degree_sign:
     cam1_b: 1     # flip to -1 if a positive step decreases the IMU angle
     cam2_b: -1    # confirmed from issue #7 probe: +200 steps → −0.882° (delta<0)
                   # positive motor steps make cam2 MORE negative → direction = -1
+
+# Populated at runtime when a manual converge succeeds. Keys are 0.5°-
+# bucketed signed target angles (e.g. "-75.0"); values are the motor step
+# count observed to put the IMU at that angle. Used to seed the next move
+# to the same angle so the Newton loop only needs small-step corrections.
+# Pruned (not wiped) on auto-cal when the reference_position shifts by more
+# than stale_seed_tolerance_steps.
+angle_history:
+  cam1_b: {}
+  cam2_b: {}

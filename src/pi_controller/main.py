@@ -462,6 +462,25 @@ async def run_startup_autocal(
                 )
                 drift_detector.set_steps_per_degree(cam_id, result.steps_per_degree)
                 drift_detector.set_target_sign(cam_id, result.direction_sign, axis="b")
+                # Prune angle_history entries whose stored motor position
+                # is now incompatible with the fresh reference. Keeps the
+                # close-to-correct entries (drift was small), drops far
+                # ones so they re-learn via a fresh Newton search.
+                conv_cfg = (
+                    drift_detector._calibration.get("convergence", {}) or {}
+                )
+                tolerance_steps = int(
+                    conv_cfg.get("stale_seed_tolerance_steps", 2000)
+                )
+                pruned = drift_detector.angle_history.invalidate_stale(
+                    cam_id=cam_id,
+                    reference_position=int(result.reference_position),
+                    reference_angle_deg=float(result.reference_angle_deg),
+                    steps_per_degree=float(result.steps_per_degree),
+                    direction_sign=int(result.direction_sign),
+                    tolerance_steps=tolerance_steps,
+                )
+                remaining = drift_detector.angle_history.count(cam_id)
                 logger.info(
                     "auto_calibrator.success",
                     cam_id=cam_id,
@@ -470,6 +489,18 @@ async def run_startup_autocal(
                     steps_per_degree=round(result.steps_per_degree, 3),
                     direction_sign=result.direction_sign,
                     iterations=result.iterations,
+                    angle_history_pruned=len(pruned),
+                    angle_history_remaining=remaining,
+                )
+                print(
+                    f"\n✓ Angle calibration SUCCESSFUL for {cam_id}:b — "
+                    f"reference {result.reference_angle_deg:+.1f}° "
+                    f"at step {result.reference_position:.0f}, "
+                    f"{result.steps_per_degree:.2f} steps/° "
+                    f"(direction {result.direction_sign:+d}, "
+                    f"{result.iterations} iter; "
+                    f"history: {remaining} kept, {len(pruned)} pruned)\n",
+                    flush=True,
                 )
             else:
                 logger.warning(
@@ -477,6 +508,11 @@ async def run_startup_autocal(
                     cam_id=cam_id,
                     error=result.error,
                     iterations=result.iterations,
+                )
+                print(
+                    f"\n✗ Angle calibration FAILED for {cam_id}:b — "
+                    f"{result.error} (after {result.iterations} iter)\n",
+                    flush=True,
                 )
     finally:
         drive_mgr.autocal_complete.set()
@@ -512,6 +548,12 @@ async def _setup_controller(config: dict, host: str, port: int) -> tuple[DriveMa
 
     drift_detector = DriftDetector(mqtt, Path("config/imu_calibration.yaml"))
     drive_mgr.drift_detector = drift_detector
+    _hist_count = drift_detector.angle_history.count()
+    logger.info("angle_history.loaded", total_entries=_hist_count)
+    print(
+        f"Angle history loaded — {_hist_count} saved angle→position entries",
+        flush=True,
+    )
     mqtt.subscribe(SUB_ALL_IMU_TELEMETRY, drift_detector.on_imu_message)
 
     async def dispatch_command(topic_str: str, payload: dict) -> None:
@@ -581,6 +623,12 @@ def run_controller_with_gui(
     # DriftDetector is constructed synchronously (no asyncio objects in __init__)
     drift_detector = DriftDetector(mqtt, Path("config/imu_calibration.yaml"))
     drive_mgr.drift_detector = drift_detector
+    _hist_count = drift_detector.angle_history.count()
+    logger.info("angle_history.loaded", total_entries=_hist_count)
+    print(
+        f"Angle history loaded — {_hist_count} saved angle→position entries",
+        flush=True,
+    )
 
     # Register all GUI pages
     gui_cfg = setup_gui(drive_mgr, config, config.get("gui", {}), drift_detector=drift_detector)
