@@ -628,9 +628,14 @@ async def auto_calibrate(
             steps_per_degree=round(steps_per_degree, 3),
         )
 
-        # ───────────── Phase 4: return to origin ─────────────
+        # ───────────── Phase 4: park at reference position ─────────────
+        # Leave the camera at the ±90° anchor it just found. Previously we
+        # moved back to start_pos, which undid all the search work and left
+        # the user looking at the camera's arbitrary boot angle (~±75°)
+        # instead of the calibrated ±90° reference. Operators expect the
+        # camera to stay where auto-cal pointed it.
         await _move_and_settle(
-            drive, start_pos,
+            drive, reference_position,
             speed=settle_speed, settle_ms=settle_ms,
         )
         iterations += 1
