@@ -20,7 +20,7 @@ import structlog
 import yaml
 from nicegui import ui, app
 
-from src.shared.models import PositionPreset
+from src.shared.models import CheckpointRef, PositionPreset, SavedSequence, SequenceStep
 
 if TYPE_CHECKING:
     from src.pi_controller.imu.drift_detector import DriftDetector
@@ -30,6 +30,7 @@ logger = structlog.get_logger()
 
 POSITIONS_FILE = Path("config/positions.yaml")
 CALIBRATION_FILE = Path("config/calibration.yaml")
+SEQUENCES_DIR = Path("config/sequences")
 
 
 # ──────────────────────────────────────────────
@@ -133,6 +134,38 @@ def load_positions() -> list[PositionPreset]:
 def save_positions(positions: list[PositionPreset]) -> None:
     data = {"positions": [p.model_dump() for p in positions]}
     POSITIONS_FILE.write_text(yaml.dump(data, default_flow_style=False))
+
+
+# ──────────────────────────────────────────────
+# Sequence Persistence
+# ──────────────────────────────────────────────
+
+def list_saved_sequences() -> list[str]:
+    """Return names of all saved sequences (stem of each YAML in config/sequences/)."""
+    SEQUENCES_DIR.mkdir(parents=True, exist_ok=True)
+    return sorted(p.stem for p in SEQUENCES_DIR.glob("*.yaml"))
+
+
+def save_sequence(seq: SavedSequence) -> None:
+    SEQUENCES_DIR.mkdir(parents=True, exist_ok=True)
+    path = SEQUENCES_DIR / f"{seq.name}.yaml"
+    tmp = path.with_suffix(".yaml.tmp")
+    data = seq.model_dump(mode="json")
+    tmp.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True))
+    import os as _os
+    _os.replace(tmp, path)
+
+
+def load_sequence(name: str) -> SavedSequence | None:
+    path = SEQUENCES_DIR / f"{name}.yaml"
+    if not path.exists():
+        return None
+    data = yaml.safe_load(path.read_text()) or {}
+    try:
+        return SavedSequence.model_validate(data)
+    except Exception:
+        logger.exception("sequence.load_failed", name=name)
+        return None
 
 
 # ──────────────────────────────────────────────
@@ -786,26 +819,228 @@ def setup_gui(
                     )
             return
 
-        if not positions:
-            ui.label(
-                "No positions defined. Go to the Positions tab first."
-            ).classes("text-orange-600 text-lg")
-            return
+        # ── Per-page mutable sequence step list ──────────────────────
+        # Each entry mirrors a SequenceStep serialised as a plain dict
+        # so NiceGUI can store it in page state without Pydantic issues.
+        seq_steps: list[dict] = []
 
-        ui.label("Select Positions for Sequence").classes("text-lg font-bold")
+        # ── Step list renderer ────────────────────────────────────────
 
-        # Checkboxes for each position
-        selected: dict[int, ui.checkbox] = {}
-        for i, preset in enumerate(positions):
-            selected[i] = ui.checkbox(
-                f"{preset.name} (cam1:a={preset.cam1_a:.0f}, cam1:b={preset.cam1_b:.0f}, "
-                f"cam2:a={preset.cam2_a:.0f}, cam2:b={preset.cam2_b:.0f})",
-                value=True,
-            )
+        @ui.refreshable
+        def render_steps() -> None:
+            if not seq_steps:
+                ui.label("No steps yet — add positions or checkpoints below.").classes(
+                    "text-gray-400 italic"
+                )
+                return
+            for i, step in enumerate(seq_steps):
+                with ui.card().classes("w-full p-2"):
+                    with ui.row().classes("items-center gap-2 w-full"):
+                        if step["type"] == "position":
+                            ui.icon("place").classes("text-blue-600 text-xl")
+                            p = step["preset"]
+                            ui.label(
+                                f"Position: {p['name']}  "
+                                f"(cam1a={p['cam1_a']:.0f}  cam1b={p['cam1_b']:.0f}  "
+                                f"cam2a={p['cam2_a']:.0f}  cam2b={p['cam2_b']:.0f})"
+                            ).classes("flex-1 text-sm")
+                        else:
+                            ui.icon("rotate_right").classes("text-green-600 text-xl")
+                            cp = step["checkpoint"]
+                            cam_id = cp["cam_id"]
+                            cp_name = cp["name"]
+                            # Show current seed position and target angle from calibration
+                            hint = ""
+                            if drift_detector is not None:
+                                cp_data = drift_detector._find_checkpoint(cam_id, cp_name)
+                                if cp_data:
+                                    active = cp_data["active_angle"]
+                                    tgt = cp_data.get(f"expected_{active}_deg", "?")
+                                    seed = cp_data.get("drive_position", "?")
+                                    hint = (
+                                        f"  target {active}={tgt}°  "
+                                        f"seed={seed} steps"
+                                    )
+                            ui.label(
+                                f"Checkpoint: {cam_id} — {cp_name}{hint}"
+                            ).classes("flex-1 text-sm text-green-800")
+
+                        with ui.button_group().props("flat"):
+                            up_btn = ui.button(
+                                icon="arrow_upward",
+                                on_click=lambda _=None, idx=i: _move_step(idx, -1),
+                            ).props("flat size=sm")
+                            up_btn.set_enabled(i > 0)
+                            dn_btn = ui.button(
+                                icon="arrow_downward",
+                                on_click=lambda _=None, idx=i: _move_step(idx, 1),
+                            ).props("flat size=sm")
+                            dn_btn.set_enabled(i < len(seq_steps) - 1)
+                            ui.button(
+                                icon="delete",
+                                on_click=lambda _=None, idx=i: _remove_step(idx),
+                            ).props("flat size=sm color=red")
+
+        def _move_step(idx: int, direction: int) -> None:
+            other = idx + direction
+            if 0 <= other < len(seq_steps):
+                seq_steps[idx], seq_steps[other] = seq_steps[other], seq_steps[idx]
+                render_steps.refresh()
+
+        def _remove_step(idx: int) -> None:
+            seq_steps.pop(idx)
+            render_steps.refresh()
+
+        # ── Step list display area ────────────────────────────────────
+        ui.label("Sequence Steps").classes("text-lg font-bold mt-4")
+        render_steps()
 
         ui.separator()
 
-        with ui.row().classes("items-end gap-4"):
+        # ── Add position step ─────────────────────────────────────────
+        with ui.card().classes("w-full mt-2"):
+            ui.label("Add Position Step").classes("font-semibold text-blue-700")
+            if not positions:
+                ui.label(
+                    "No positions defined — go to Positions tab first."
+                ).classes("text-orange-500 text-sm")
+            else:
+                pos_select = ui.select(
+                    {i: p.name for i, p in enumerate(positions)},
+                    label="Position preset",
+                    value=0,
+                ).classes("w-64")
+
+                def _add_position_step() -> None:
+                    idx = pos_select.value
+                    if idx is None or idx >= len(positions):
+                        return
+                    preset = positions[idx]
+                    seq_steps.append({
+                        "type": "position",
+                        "preset": preset.model_dump(),
+                        "checkpoint": None,
+                    })
+                    render_steps.refresh()
+
+                ui.button("Add to Sequence", on_click=_add_position_step).props(
+                    "color=blue size=sm"
+                )
+
+        # ── Add checkpoint step ───────────────────────────────────────
+        if drift_detector is not None:
+            with ui.card().classes("w-full mt-2"):
+                ui.label("Add Checkpoint Step").classes("font-semibold text-green-700")
+                ui.label(
+                    "The Newton search will be seeded with the last successful motor "
+                    "position for this checkpoint — updated automatically after each run."
+                ).classes("text-gray-500 text-xs mb-1")
+
+                cam_select = ui.select(
+                    {"cam1": "cam1", "cam2": "cam2"},
+                    label="Camera",
+                    value="cam1",
+                ).classes("w-32")
+
+                def _get_cp_options(cam_id: str) -> dict:
+                    cps = drift_detector.get_checkpoints(cam_id) or []
+                    if not cps:
+                        return {}
+                    return {cp["name"]: cp["name"] for cp in cps}
+
+                cp_select = ui.select(
+                    _get_cp_options("cam1"),
+                    label="Checkpoint",
+                ).classes("w-48")
+
+                def _refresh_cp_options() -> None:
+                    cp_select.options = _get_cp_options(cam_select.value or "cam1")
+                    cp_select.update()
+
+                cam_select.on("update:model-value", lambda _: _refresh_cp_options())
+
+                def _add_checkpoint_step() -> None:
+                    cam_id = cam_select.value or "cam1"
+                    cp_name = cp_select.value
+                    if not cp_name:
+                        ui.notify(
+                            "No checkpoint selected. Define checkpoints in the Calibration tab.",
+                            type="warning",
+                        )
+                        return
+                    seq_steps.append({
+                        "type": "checkpoint",
+                        "preset": None,
+                        "checkpoint": {"cam_id": cam_id, "name": cp_name},
+                    })
+                    render_steps.refresh()
+
+                ui.button("Add to Sequence", on_click=_add_checkpoint_step).props(
+                    "color=green size=sm"
+                )
+
+        ui.separator()
+
+        # ── Save / Load ───────────────────────────────────────────────
+        with ui.row().classes("items-end gap-4 mt-2"):
+            seq_name_input = ui.input(
+                label="Sequence name", placeholder="my_sequence"
+            ).classes("w-48")
+
+            def _save_sequence() -> None:
+                name = (seq_name_input.value or "").strip()
+                if not name:
+                    ui.notify("Enter a sequence name before saving", type="warning")
+                    return
+                if not seq_steps:
+                    ui.notify("Add at least one step before saving", type="warning")
+                    return
+                try:
+                    steps_models = [SequenceStep.model_validate(s) for s in seq_steps]
+                    seq = SavedSequence(
+                        name=name,
+                        steps=steps_models,
+                        dwell_time_ms=int(dwell_input.value or 500),
+                        repeat_count=int(repeat_input.value or 1),
+                    )
+                    save_sequence(seq)
+                    load_select.options = {n: n for n in list_saved_sequences()}
+                    load_select.update()
+                    ui.notify(f"Saved '{name}'", type="positive")
+                except Exception as exc:
+                    ui.notify(f"Save failed: {exc}", type="negative")
+
+            ui.button("Save Sequence", on_click=_save_sequence).props("color=teal size=sm")
+
+            saved_names = list_saved_sequences()
+            load_select = ui.select(
+                {n: n for n in saved_names} if saved_names else {},
+                label="Load sequence",
+            ).classes("w-48")
+
+            def _load_sequence() -> None:
+                name = load_select.value
+                if not name:
+                    return
+                seq = load_sequence(name)
+                if seq is None:
+                    ui.notify(f"Failed to load '{name}'", type="negative")
+                    return
+                seq_steps.clear()
+                for step in seq.steps:
+                    seq_steps.append(step.model_dump(mode="json"))
+                dwell_input.value = seq.dwell_time_ms
+                repeat_input.value = seq.repeat_count
+                seq_name_input.value = seq.name
+                render_steps.refresh()
+                ui.notify(f"Loaded '{name}' ({len(seq.steps)} steps)", type="positive")
+
+            ui.button("Load", on_click=_load_sequence).props("color=blue-grey size=sm")
+
+        ui.separator()
+
+        # ── Timing settings ───────────────────────────────────────────
+        with ui.row().classes("items-end gap-4 mt-2"):
             dwell_input = ui.number(
                 label="Dwell time (ms)", value=500, min=0, max=60000, step=100
             ).classes("w-40")
@@ -816,19 +1051,22 @@ def setup_gui(
 
         ui.separator()
         status_label = ui.label("Status: idle").classes("text-lg")
-        cycle_label = ui.label("")
+
+        # ── Run / Stop ────────────────────────────────────────────────
 
         async def start_sequence():
             nonlocal sequence_task
             if drive_mgr.sequence_running:
                 ui.notify("Sequence already running", type="warning")
                 return
+            if not seq_steps:
+                ui.notify("Add at least one step to the sequence", type="warning")
+                return
 
-            selected_positions = [
-                positions[i] for i, cb in selected.items() if cb.value
-            ]
-            if not selected_positions:
-                ui.notify("Select at least one position", type="warning")
+            try:
+                steps_models = [SequenceStep.model_validate(s) for s in seq_steps]
+            except Exception as exc:
+                ui.notify(f"Invalid step data: {exc}", type="negative")
                 return
 
             status_label.text = "Status: RUNNING"
@@ -837,7 +1075,7 @@ def setup_gui(
 
             sequence_task = asyncio.create_task(
                 drive_mgr.run_sequence(
-                    selected_positions,
+                    steps_models,
                     dwell_time_ms=int(dwell_input.value or 500),
                     repeat_count=int(repeat_input.value or 1),
                 )
@@ -848,6 +1086,7 @@ def setup_gui(
                 status_label.text = "Status: completed"
                 status_label.classes(replace="text-lg text-blue-700")
                 ui.notify("Sequence completed", type="positive")
+                render_steps.refresh()  # refresh to show updated seed positions
             except asyncio.CancelledError:
                 status_label.text = "Status: stopped"
                 status_label.classes(replace="text-lg text-orange-700")
@@ -864,7 +1103,7 @@ def setup_gui(
             status_label.classes(replace="text-lg text-orange-700")
             ui.notify("Sequence stopped", type="warning")
 
-        with ui.row().classes("gap-2"):
+        with ui.row().classes("gap-2 mt-2"):
             ui.button("Start Sequence", on_click=start_sequence).props(
                 "color=green size=lg"
             )

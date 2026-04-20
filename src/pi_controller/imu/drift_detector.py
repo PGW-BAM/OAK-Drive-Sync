@@ -266,6 +266,7 @@ class DriftDetector:
         *,
         checkpoint_name: str = "",
         resync_position: float | None = None,
+        seed_position: int | None = None,
     ) -> ConvergeResult:
         """Seed-then-Newton closed-loop angle converge.
 
@@ -325,16 +326,59 @@ class DriftDetector:
             # loop. Saves many iterations and, more importantly, keeps the
             # first Newton step small — no more "goes totally wrong way"
             # when the current position is 40° off target.
-            seed = self.angle_history.seed_for(
-                cam_id=cam_id,
-                target_angle_deg=target_angle_deg,
-                reference_position=(
-                    int(reference_position) if reference_position is not None else None
-                ),
-                reference_angle_deg=reference_angle_deg,
-                steps_per_degree=steps_per_deg,
-                direction_sign=direction_sign,
-            )
+            #
+            # Priority: explicit seed_position (checkpoint last-good) →
+            #           angle_history bucket → reference-anchor formula.
+
+            # Validate an explicit checkpoint-derived seed against staleness.
+            # If the stored position has drifted > stale_seed_tolerance_steps
+            # from the formula estimate (e.g. after a large auto-cal shift),
+            # discard it so the formula or angle_history takes over.
+            if seed_position is not None and (
+                reference_position is not None
+                and reference_angle_deg is not None
+                and steps_per_deg > 0
+            ):
+                stale_tolerance = int(conv.get("stale_seed_tolerance_steps", 2000))
+                anchor_est = int(round(
+                    reference_position
+                    + (target_angle_deg - reference_angle_deg)
+                    * steps_per_deg
+                    * direction_sign
+                ))
+                if abs(seed_position - anchor_est) > stale_tolerance:
+                    logger.warning(
+                        "drift_detector.converge_checkpoint_seed_stale",
+                        cam_id=cam_id,
+                        checkpoint_name=checkpoint_name,
+                        seed_position=seed_position,
+                        anchor_estimate=anchor_est,
+                        diff=abs(seed_position - anchor_est),
+                        tolerance=stale_tolerance,
+                        msg="Checkpoint seed discarded — falling back to formula",
+                    )
+                    seed_position = None
+
+            if seed_position is not None:
+                seed: int | None = seed_position
+                logger.info(
+                    "drift_detector.converge_checkpoint_seed",
+                    cam_id=cam_id,
+                    checkpoint_name=checkpoint_name,
+                    target_angle_deg=target_angle_deg,
+                    seed_position=seed,
+                )
+            else:
+                seed = self.angle_history.seed_for(
+                    cam_id=cam_id,
+                    target_angle_deg=target_angle_deg,
+                    reference_position=(
+                        int(reference_position) if reference_position is not None else None
+                    ),
+                    reference_angle_deg=reference_angle_deg,
+                    steps_per_degree=steps_per_deg,
+                    direction_sign=direction_sign,
+                )
             if seed is not None:
                 pre_pos = drive.current_position
                 if abs(seed - pre_pos) >= max(1, int(steps_per_deg * motion_threshold_deg)):
@@ -444,6 +488,13 @@ class DriftDetector:
                     logger.exception(
                         "drift_detector.converge_history_record_failed",
                         cam_id=cam_id,
+                    )
+                # Persist final_position as the new seed for next visit to
+                # this checkpoint. Only updates the motor-position field —
+                # expected_*_deg and active_angle are not touched.
+                if checkpoint_name:
+                    self._update_checkpoint_position(
+                        cam_id, checkpoint_name, int(newton.final_position)
                     )
                 event = await self._publish_converge_event(
                     cam_id=cam_id,
@@ -661,6 +712,37 @@ class DriftDetector:
     # ──────────────────────────────────────────────
     # Internal helpers
     # ──────────────────────────────────────────────
+
+    def _update_checkpoint_position(self, cam_id: str, name: str, position: int) -> None:
+        """Overwrite a checkpoint's drive_position with the last converged motor position.
+
+        Called after every successful converge() so the stored value becomes the
+        seed for the next visit. The angle-target fields are left unchanged.
+        """
+        entries: list = (
+            self._calibration
+            .get("checkpoints", {})
+            .get(cam_id, {})
+            .get("b", [])
+        )
+        for cp in entries:
+            if cp["name"] == name:
+                old_pos = cp.get("drive_position")
+                cp["drive_position"] = position
+                self._save_calibration()
+                logger.info(
+                    "drift_detector.checkpoint_position_updated",
+                    cam_id=cam_id,
+                    name=name,
+                    old_position=old_pos,
+                    new_position=position,
+                )
+                return
+        logger.warning(
+            "drift_detector.checkpoint_position_update_not_found",
+            cam_id=cam_id,
+            name=name,
+        )
 
     def _find_checkpoint(self, cam_id: str, name: str) -> dict | None:
         return next(

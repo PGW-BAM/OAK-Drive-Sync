@@ -25,6 +25,7 @@ from src.shared.models import (
     DrivePosition,
     PiHealth,
     PositionPreset,
+    SequenceStep,
 )
 from src.shared.mqtt_client import MQTTClient
 from src.shared.mqtt_topics import (
@@ -289,22 +290,36 @@ class DriveManager:
 
     async def run_sequence(
         self,
-        positions: list[PositionPreset],
+        steps: list[PositionPreset | SequenceStep],
         dwell_time_ms: int = 500,
         repeat_count: int = 1,
     ) -> None:
-        """Run a cyclic capture sequence through positions.
+        """Run a cyclic capture sequence through a mixed list of steps.
 
-        For each position: move all drives → settle → notify cameras → dwell → next.
+        Each step is either:
+          - SequenceStep(type="position")  → open-loop move of all 4 drives
+          - SequenceStep(type="checkpoint") → closed-loop angle converge of cam:b
+
+        Backwards compatible: plain PositionPreset items are normalised to
+        position steps automatically.
+
         repeat_count=0 means infinite.
         """
+        # Normalise: wrap bare PositionPreset items into SequenceStep
+        normalised: list[SequenceStep] = []
+        for s in steps:
+            if isinstance(s, PositionPreset):
+                normalised.append(SequenceStep(type="position", preset=s))
+            else:
+                normalised.append(s)
+
         self._sequence_running = True
         self._sequence_stop.clear()
         cycle = 0
 
         logger.info(
             "sequence.start",
-            positions=len(positions),
+            steps=len(normalised),
             repeats=repeat_count,
             dwell_ms=dwell_time_ms,
         )
@@ -316,28 +331,90 @@ class DriveManager:
                 cycle += 1
                 logger.info("sequence.cycle", cycle=cycle)
 
-                for i, preset in enumerate(positions):
+                for i, step in enumerate(normalised):
                     if self._sequence_stop.is_set():
                         break
 
-                    logger.info("sequence.moving_to", position=preset.name, step=i + 1)
+                    seq_id = f"seq-cycle{cycle}-step{i}"
 
-                    # Move all drives in parallel
-                    await self.move_all_to_position(preset)
+                    if step.type == "position" and step.preset is not None:
+                        preset = step.preset
+                        logger.info("sequence.moving_to", position=preset.name, step=i + 1)
 
-                    # Settling delay
-                    await asyncio.sleep(self.settling_delay_ms / 1000.0)
+                        await self.move_all_to_position(preset)
+                        await asyncio.sleep(self.settling_delay_ms / 1000.0)
 
-                    # Publish "reached" for each drive → Windows cameras capture
-                    targets = preset.as_drive_targets()
-                    for key in targets:
-                        drive = self.drives.get(key)
-                        if drive:
-                            await self._publish_position(drive, f"seq-cycle{cycle}-step{i}")
+                        for key in preset.as_drive_targets():
+                            drive = self.drives.get(key)
+                            if drive:
+                                await self._publish_position(drive, seq_id)
 
-                    logger.info("sequence.position_reached", position=preset.name)
+                        logger.info("sequence.position_reached", position=preset.name)
 
-                    # Dwell time (pause at position)
+                    elif step.type == "checkpoint" and step.checkpoint is not None:
+                        cp_ref = step.checkpoint
+                        cam_id = cp_ref.cam_id
+                        name = cp_ref.name
+
+                        if self.drift_detector is None:
+                            logger.warning(
+                                "sequence.checkpoint_skipped_no_detector",
+                                cam_id=cam_id,
+                                name=name,
+                            )
+                        else:
+                            cp = self.drift_detector._find_checkpoint(cam_id, name)
+                            if cp is None:
+                                logger.warning(
+                                    "sequence.checkpoint_not_found",
+                                    cam_id=cam_id,
+                                    name=name,
+                                )
+                            else:
+                                drive = self.drives.get(f"{cam_id}:b")
+                                if drive is None or not isinstance(drive, TinkerforgeDrive):
+                                    logger.warning(
+                                        "sequence.checkpoint_no_drive",
+                                        cam_id=cam_id,
+                                        name=name,
+                                    )
+                                else:
+                                    active_angle = cp["active_angle"]
+                                    target_angle_deg = float(
+                                        cp[f"expected_{active_angle}_deg"]
+                                    )
+                                    seed_position = int(cp.get("drive_position", 0))
+
+                                    logger.info(
+                                        "sequence.checkpoint_converge",
+                                        cam_id=cam_id,
+                                        name=name,
+                                        target_angle_deg=target_angle_deg,
+                                        seed_position=seed_position,
+                                        step=i + 1,
+                                    )
+
+                                    result = await self.drift_detector.converge(
+                                        cam_id=cam_id,
+                                        drive=drive,
+                                        target_angle_deg=target_angle_deg,
+                                        active_angle=active_angle,
+                                        checkpoint_name=name,
+                                        seed_position=seed_position,
+                                    )
+
+                                    if not result.converged:
+                                        logger.warning(
+                                            "sequence.checkpoint_converge_failed",
+                                            cam_id=cam_id,
+                                            name=name,
+                                            iterations=result.iterations,
+                                            final_error_deg=result.final_error_deg,
+                                        )
+
+                                    await self._publish_position(drive, seq_id)
+
+                    # Dwell at this step
                     await asyncio.sleep(dwell_time_ms / 1000.0)
 
         finally:

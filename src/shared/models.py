@@ -217,6 +217,28 @@ class SequenceConfig(BaseModel):
     settling_delay_ms: int = 150
 
 
+class CheckpointRef(BaseModel):
+    """Reference to a named IMU checkpoint within a sequence step."""
+    cam_id: Literal["cam1", "cam2"]
+    name: str
+
+
+class SequenceStep(BaseModel):
+    """One step in a mixed sequence — open-loop position preset OR closed-loop checkpoint."""
+    type: Literal["position", "checkpoint"]
+    preset: PositionPreset | None = None      # set when type="position"
+    checkpoint: CheckpointRef | None = None   # set when type="checkpoint"
+
+
+class SavedSequence(BaseModel):
+    """Persisted sequence definition (config/sequences/*.yaml)."""
+    name: str
+    steps: list[SequenceStep]
+    dwell_time_ms: int = 500
+    repeat_count: int = 1
+    created_at: datetime = Field(default_factory=_now)
+
+
 # ──────────────────────────────────────────────
 # Email Alert
 # ──────────────────────────────────────────────
