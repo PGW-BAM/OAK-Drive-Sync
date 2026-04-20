@@ -267,6 +267,11 @@ def setup_gui(
     positions: list[PositionPreset] = load_positions()
     sequence_task: asyncio.Task | None = None
 
+    # Give DriveManager a live reference so run_sequence can write back
+    # updated motor-position seeds after successful angle convergence.
+    drive_mgr.positions = positions
+    drive_mgr.save_positions_fn = lambda: save_positions(positions)
+
     # One JogCoalescer per drive — shared across manual and calibration pages.
     # Coalesces rapid jog clicks into a single move to protect the stepper drivers.
     jog_coalescers: dict[str, JogCoalescer] = {
@@ -686,6 +691,18 @@ def setup_gui(
 
         positions_container = ui.column().classes("w-full")
 
+        def _capture_angles() -> tuple[float | None, float | None]:
+            """Read current IMU roll angles for cam1 and cam2 from drift_detector."""
+            if drift_detector is None:
+                return None, None
+            imu1 = drift_detector.get_latest_imu("cam1")
+            imu2 = drift_detector.get_latest_imu("cam2")
+            active1 = drift_detector.get_active_angle("cam1")
+            active2 = drift_detector.get_active_angle("cam2")
+            a1 = (getattr(imu1, f"{active1}_deg") if imu1 else None)
+            a2 = (getattr(imu2, f"{active2}_deg") if imu2 else None)
+            return a1, a2
+
         def refresh_positions_list():
             positions_container.clear()
             with positions_container:
@@ -695,14 +712,30 @@ def setup_gui(
 
                 for i, preset in enumerate(positions):
                     with ui.card().classes("w-full"):
-                        with ui.row().classes("items-center w-full"):
+                        with ui.row().classes("items-center w-full flex-wrap gap-2"):
                             ui.label(preset.name).classes("font-bold text-lg flex-grow")
 
-                            with ui.row().classes("gap-1 text-sm"):
-                                ui.label(f"cam1:a={preset.cam1_a:.0f}")
-                                ui.label(f"cam1:b={preset.cam1_b:.0f}")
-                                ui.label(f"cam2:a={preset.cam2_a:.0f}")
-                                ui.label(f"cam2:b={preset.cam2_b:.0f}")
+                            with ui.column().classes("text-xs gap-0"):
+                                with ui.row().classes("gap-2"):
+                                    ui.label(f"cam1:a = {preset.cam1_a:.0f}").classes("text-gray-600")
+                                    ui.label(f"cam2:a = {preset.cam2_a:.0f}").classes("text-gray-600")
+                                with ui.row().classes("gap-2"):
+                                    b1_txt = f"cam1:b = {preset.cam1_b:.0f}"
+                                    if preset.cam1_b_angle_deg is not None:
+                                        b1_txt += f"  →  target {preset.cam1_b_angle_deg:+.2f}°"
+                                    b2_txt = f"cam2:b = {preset.cam2_b:.0f}"
+                                    if preset.cam2_b_angle_deg is not None:
+                                        b2_txt += f"  →  target {preset.cam2_b_angle_deg:+.2f}°"
+                                    ui.label(b1_txt).classes(
+                                        "text-indigo-700 font-semibold"
+                                        if preset.cam1_b_angle_deg is not None
+                                        else "text-gray-600"
+                                    )
+                                    ui.label(b2_txt).classes(
+                                        "text-indigo-700 font-semibold"
+                                        if preset.cam2_b_angle_deg is not None
+                                        else "text-gray-600"
+                                    )
 
                             async def goto_pos(p=preset):
                                 await drive_mgr.move_all_to_position(p)
@@ -710,15 +743,28 @@ def setup_gui(
                             ui.button("Go To", on_click=goto_pos).props("color=primary size=sm")
 
                             def capture_pos(idx=i):
+                                old = positions[idx]
+                                a1, a2 = _capture_angles()
                                 positions[idx] = PositionPreset(
-                                    name=positions[idx].name,
+                                    name=old.name,
                                     cam1_a=drive_mgr.drives.get("cam1:a", _DummyDrive()).current_position,
                                     cam1_b=drive_mgr.drives.get("cam1:b", _DummyDrive()).current_position,
                                     cam2_a=drive_mgr.drives.get("cam2:a", _DummyDrive()).current_position,
                                     cam2_b=drive_mgr.drives.get("cam2:b", _DummyDrive()).current_position,
+                                    cam1_b_angle_deg=round(a1, 3) if a1 is not None else old.cam1_b_angle_deg,
+                                    cam2_b_angle_deg=round(a2, 3) if a2 is not None else old.cam2_b_angle_deg,
                                 )
                                 save_positions(positions)
                                 refresh_positions_list()
+                                angle_msg = ""
+                                if a1 is not None:
+                                    angle_msg += f"  cam1:b→{a1:+.2f}°"
+                                if a2 is not None:
+                                    angle_msg += f"  cam2:b→{a2:+.2f}°"
+                                ui.notify(
+                                    f"Captured '{old.name}'{angle_msg}",
+                                    type="positive",
+                                )
 
                             ui.button("Capture Current", on_click=capture_pos).props(
                                 "color=teal size=sm"
@@ -770,18 +816,29 @@ def setup_gui(
                 if not name_input.value:
                     ui.notify("Please enter a name", type="warning")
                     return
+                a1, a2 = _capture_angles()
                 preset = PositionPreset(
                     name=name_input.value,
                     cam1_a=drive_mgr.drives.get("cam1:a", _DummyDrive()).current_position,
                     cam1_b=drive_mgr.drives.get("cam1:b", _DummyDrive()).current_position,
                     cam2_a=drive_mgr.drives.get("cam2:a", _DummyDrive()).current_position,
                     cam2_b=drive_mgr.drives.get("cam2:b", _DummyDrive()).current_position,
+                    cam1_b_angle_deg=round(a1, 3) if a1 is not None else None,
+                    cam2_b_angle_deg=round(a2, 3) if a2 is not None else None,
                 )
                 positions.append(preset)
                 save_positions(positions)
                 name_input.value = ""
                 refresh_positions_list()
-                ui.notify(f"Position '{preset.name}' captured from current", type="positive")
+                angle_msg = ""
+                if a1 is not None:
+                    angle_msg += f"  cam1:b→{a1:+.2f}°"
+                if a2 is not None:
+                    angle_msg += f"  cam2:b→{a2:+.2f}°"
+                ui.notify(
+                    f"Position '{preset.name}' captured from current{angle_msg}",
+                    type="positive",
+                )
 
             ui.button("Add from Current Position", on_click=add_from_current).props(
                 "color=teal"

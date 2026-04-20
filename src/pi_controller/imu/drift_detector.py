@@ -701,6 +701,16 @@ class DriftDetector:
         conv.setdefault("steps_per_degree_sign", {})[f"{cam_id}_{axis}"] = int(sign)
         self._save_calibration()
 
+    def get_active_angle(self, cam_id: str, axis: str = "b") -> str:
+        """Return "roll" or "pitch" — the IMU axis used for closed-loop convergence.
+        Reads from auto_calibration.active_angle config; defaults to "roll"."""
+        return (
+            self._calibration
+            .get("auto_calibration", {})
+            .get("active_angle", {})
+            .get(f"{cam_id}_{axis}", "roll")
+        )
+
     def get_target_sign(self, cam_id: str, axis: str = "b") -> int:
         """Per-camera sign used to turn a user-entered angle magnitude into a
         signed target for converge(). Mirrors `steps_per_degree_sign` in the

@@ -197,9 +197,14 @@ class CaptureSequence(BaseModel):
 class PositionPreset(BaseModel):
     name: str
     cam1_a: float = 0.0
-    cam1_b: float = 0.0
+    cam1_b: float = 0.0   # last-known motor position for cam1:b (seed only — drifts)
     cam2_a: float = 0.0
-    cam2_b: float = 0.0
+    cam2_b: float = 0.0   # last-known motor position for cam2:b (seed only — drifts)
+    # Target IMU angles for radial drives. When set, sequences converge to this angle
+    # instead of open-loop moving to the motor position above. The motor position is
+    # used only as a seed to speed up the Newton search.
+    cam1_b_angle_deg: float | None = None
+    cam2_b_angle_deg: float | None = None
 
     def as_drive_targets(self) -> dict[str, float]:
         return {
@@ -208,6 +213,9 @@ class PositionPreset(BaseModel):
             "cam2:a": self.cam2_a,
             "cam2:b": self.cam2_b,
         }
+
+    def has_angle_target(self, cam_id: str) -> bool:
+        return getattr(self, f"{cam_id}_b_angle_deg", None) is not None
 
 
 class SequenceConfig(BaseModel):

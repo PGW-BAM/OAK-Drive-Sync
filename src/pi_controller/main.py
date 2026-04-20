@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Callable
 
 import click
 import structlog
@@ -77,6 +78,10 @@ class DriveManager:
         # failure). handle_move's angle-driven branch waits briefly on this
         # before computing a coarse target from reference_position.
         self.autocal_complete: asyncio.Event = asyncio.Event()
+        # Live reference to the GUI positions list so run_sequence can write
+        # back updated motor-position seeds after successful angle convergence.
+        self.positions: list[PositionPreset] = []
+        self.save_positions_fn: Callable[[], None] | None = None
         self._init_drives()
 
     def _init_drives(self) -> None:
@@ -341,7 +346,76 @@ class DriveManager:
                         preset = step.preset
                         logger.info("sequence.moving_to", position=preset.name, step=i + 1)
 
-                        await self.move_all_to_position(preset)
+                        # Axis-a drives: always open-loop in parallel
+                        a_tasks = []
+                        for cam_id in ("cam1", "cam2"):
+                            drive_a = self.drives.get(f"{cam_id}:a")
+                            if drive_a:
+                                a_tasks.append(
+                                    drive_a.move_to(getattr(preset, f"{cam_id}_a"))
+                                )
+                        if a_tasks:
+                            await asyncio.gather(*a_tasks)
+
+                        await asyncio.sleep(self.settling_delay_ms / 1000.0)
+
+                        # Axis-b drives: converge to saved angle if target stored,
+                        # else open-loop. Sequential (IMU responses must not cross-wire).
+                        for cam_id in ("cam1", "cam2"):
+                            drive_b = self.drives.get(f"{cam_id}:b")
+                            if drive_b is None:
+                                continue
+                            angle_target = getattr(preset, f"{cam_id}_b_angle_deg", None)
+                            motor_seed = int(getattr(preset, f"{cam_id}_b", 0))
+
+                            if (
+                                angle_target is not None
+                                and self.drift_detector is not None
+                                and isinstance(drive_b, TinkerforgeDrive)
+                            ):
+                                active_angle = self.drift_detector.get_active_angle(cam_id)
+                                logger.info(
+                                    "sequence.angle_converge",
+                                    cam_id=cam_id,
+                                    target_angle_deg=angle_target,
+                                    seed_position=motor_seed,
+                                    position=preset.name,
+                                )
+                                result = await self.drift_detector.converge(
+                                    cam_id=cam_id,
+                                    drive=drive_b,
+                                    target_angle_deg=angle_target,
+                                    active_angle=active_angle,
+                                    checkpoint_name=f"pos:{preset.name}",
+                                    seed_position=motor_seed,
+                                )
+                                if result.converged:
+                                    new_seed = int(drive_b.current_position)
+                                    # Write updated motor position back so next
+                                    # sequence run seeds closer to the right spot.
+                                    setattr(preset, f"{cam_id}_b", float(new_seed))
+                                    for p in self.positions:
+                                        if p.name == preset.name:
+                                            setattr(p, f"{cam_id}_b", float(new_seed))
+                                            break
+                                    if self.save_positions_fn is not None:
+                                        try:
+                                            self.save_positions_fn()
+                                        except Exception:
+                                            logger.exception(
+                                                "sequence.save_positions_failed"
+                                            )
+                                else:
+                                    logger.warning(
+                                        "sequence.angle_converge_failed",
+                                        cam_id=cam_id,
+                                        position=preset.name,
+                                        iterations=result.iterations,
+                                        final_error_deg=result.final_error_deg,
+                                    )
+                            else:
+                                await drive_b.move_to(getattr(preset, f"{cam_id}_b"))
+
                         await asyncio.sleep(self.settling_delay_ms / 1000.0)
 
                         for key in preset.as_drive_targets():
