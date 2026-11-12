@@ -37,9 +37,11 @@ camera = [
     "opencv-python>=4.9.0",
     "numpy>=1.26.0",
 ]
-# Digital twin (src/sim) is pure Python; trimesh only for loading scanned specimen meshes
+# Digital twin (src/sim) is pure Python; trimesh only for loading scanned specimen meshes,
+# nicegui for the 3D view (src/sim/view.py, `oak-twin`)
 sim = [
     "trimesh>=4.0.0",
+    "nicegui>=2.0.0",
 ]
 # All dependencies (development)
 dev = [
@@ -55,6 +57,7 @@ dev = [
 oak-pi = "src.pi_controller.main:cli"
 oak-cam = "src.win_controller.main:cli"
 oak-monitor = "src.monitoring.main:cli"
+oak-twin = "src.sim.view:cli"
 
 [build-system]
 requires = ["hatchling"]

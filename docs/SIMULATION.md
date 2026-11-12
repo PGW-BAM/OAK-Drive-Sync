@@ -131,3 +131,65 @@ setzen `_simulated = False`.
 - Der Fake-Broker simuliert weder QoS noch LWT noch Reconnects; `stop()` beendet `run()` sofort.
 - `_setup_controller` erzeugt einen echten `MQTTClient` (nicht injizierbar); der E2E-Test baut die gleiche
   Verdrahtung daher nach.
+
+## Schritt 4: 3D-Ansicht und Bedienfeld (`src/sim/view.py`)
+
+Interaktive Browser-Ansicht des Aufbaus (NiceGUI `ui.scene`, three.js) plus Bedienfeld. Szene in
+Probenkoordinaten (mm, z nach oben): Probe (`Specimen.mesh()`, grau), Schweißnaht (gelbes Band),
+Spannbacken (transparent, 125 mm je Ende), je Kamera Gehäuse an der Linsenpose, Pivot-Achse, Bogen des
+Tilt-Bereichs (Soft-Limits amber, Endschalter rot), vertikale Schiene mit Soft-/Endschalter-Markern,
+optische Achse bis zum Treffpunkt, FOV-Frustum und Footprint auf der Fläche (grün = Schweißnaht im Bild,
+rot = nicht im Bild). Kamerapresets: Seite, Vorne, Iso (Maus: drehen/zoomen).
+
+### Starten
+
+```bash
+pip install nicegui                    # bzw. uv pip install -e ".[sim]"
+python -m src.sim.view                 # Offline: http://127.0.0.1:8081  (Option --port, --host, --rig-config)
+oak-twin --port 8081                   # gleichwertig (Console-Script)
+
+oak-pi run --sim                       # Live: zusätzlich Seite http://<pi>:8080/twin
+```
+
+- **Offline:** Slider/Zahlenfelder setzen das `RigModel` direkt (sofort wirksam), kein MQTT, keine Antriebe.
+  Standard-Port 8081, damit er nicht mit der Pi-GUI (8080) kollidiert.
+- **Live (`--sim` mit GUI):** `main.py` registriert die Seite `/twin` an der bestehenden NiceGUI-App und bindet
+  sie an `get_shared_rig()`; ein 10-Hz-Timer liest die Pose, während die Sim-Antriebe fahren. Die Fahr-Buttons
+  („Fahren“, „Anfahren“, Sweep) rufen `drive.move_to(...)` über den `DriveManager` auf (Soft-Limits, Endschalter,
+  Bewegungsprofil der Sim-Antriebe wirken). Das ist der direkte Drive-Aufruf, nicht der MQTT-Pfad
+  `DriveManager.handle_move`. Zusätzliche Zeile „Antriebe“ zeigt State (moving/reached/fault) und ausgelösten Endschalter.
+
+### Bedienfeld je Kamera
+
+- Slider + Zahlenfeld für Höhe h (mm) und Tilt θ (°) innerhalb des Hubs, darunter Ist-Wert und Schritte
+  je Achse (a/b). Offline wirken sie sofort; live nur über „Fahren (über Antriebe)“.
+- Anzeigen: Treffer-z, Abstand Linse→Treffer, Einfallswinkel zur Flächennormalen, Footprint B × H, GSD (h × v),
+  Naht im Bild (Abdeckung der Nahtlinie), IMU Roll/Pitch, Limit je Achse (OK / Soft-Limit amber /
+  ENDSCHALTER rot).
+- IK: Ziel-z (Default 0 = Naht), Modus „senkrecht zur Oberfläche“ oder „fester Winkel“, Button „Anfahren“
+  (`RigModel.solve`). Nicht erreichbar → rote Meldung mit Grenze und Wert, es wird nicht gefahren.
+- Sweep: Liste von Ziel-z-Werten (Default −20…+20), fährt beide Kameras nacheinander an (senkrechte Sicht) und
+  füllt eine Tabelle (Ziel-z, Kamera, h, θ, erreichbar).
+
+### Soll/Ist-Ziele (provisorisches JSON-Format, `src/sim/targets.py`)
+
+Liste von Zielen; Textfeld oder JSON-Datei-Upload. „Berechnen“ zeigt Soll (IK), Ist (aktuelle Pose), Δ und
+Erreichbarkeit. Headless nutzbar: `parse_targets(text)` und `solve_targets(rig, targets)`.
+
+```json
+[
+  {"cam_id": "cam1", "z": 0.0},
+  {"cam_id": "cam1", "z": 12.0, "theta_deg": 10.0},
+  {"cam_id": "cam2", "z": 0.0, "normal": [-0.97, 0.0, 0.24]}
+]
+```
+
+| Feld | Bedeutung |
+|---|---|
+| `cam_id` | Kamera (`cam1`, `cam2`) — Pflicht |
+| `z` | Zielhöhe auf der Probenoberfläche in mm (Default 0 = Naht) |
+| `normal` | optional `[nx, ny, nz]`: Flächennormale (Probenkoordinaten, aus der Fläche heraus), zu der die Kamera antiparallel blicken soll. `ny` muss ≈ 0 sein (keine Gier-Achse), `nx` muss zur Kamera zeigen (cam1 > 0, cam2 < 0), sonst „nicht erreichbar“ |
+| `theta_deg` | optional fester Tilt (nur Höhe wird gelöst); schließt `normal` aus |
+
+Ohne `normal`/`theta_deg`: senkrecht zur lokalen Oberfläche (inkl. Wulstneigung). Das Format ist provisorisch
+und noch nicht mit einer realen Soll/Ist-Quelle abgestimmt.

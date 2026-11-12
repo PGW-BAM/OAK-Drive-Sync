@@ -857,6 +857,14 @@ def run_controller_with_gui(
     # Register all GUI pages
     gui_cfg = setup_gui(drive_mgr, config, config.get("gui", {}), drift_detector=drift_detector)
 
+    if config.get("sim"):
+        # Digital twin: 3D view at /twin, bound to the shared RigModel; its move buttons go
+        # through drive_mgr's sim drives (see src/sim/view.py, docs/SIMULATION.md).
+        from src.sim.drives import get_shared_rig
+        from src.sim.view import register_twin_page
+
+        register_twin_page(get_shared_rig(), drive_mgr=drive_mgr)
+
     # Wire up MQTT command dispatch
     async def dispatch_command(topic_str: str, payload: dict) -> None:
         if topic_str.endswith("/move"):
