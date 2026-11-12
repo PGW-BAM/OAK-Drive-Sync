@@ -36,9 +36,19 @@ _FALLBACK_COLORS = ["#7c3aed", "#0d9488", "#db2777"]
 WELD_COLOR = "#eab308"
 GOOD, BAD, WARN = "#16a34a", "#dc2626", "#d97706"
 
-BODY = (100.0, 50.0, 60.0)  # camera housing: width (image-right), height (image-up), depth (mm)
-RAIL_OFFSET = 140.0  # rail sits this far behind the pivot (away from the specimen)
+BODY = (130.0, 75.0, 38.0)  # OAK-D PoE housing from CAD: width (image-right), height, depth (mm)
+RAIL_OFFSET = 200.0  # rail sits this far behind the pivot (away from the specimen); estimate
 ARC_RADIUS = 100.0  # drawn radius of the tilt-range arc around the pivot
+
+# Radial drive (CAD "Schwenkvorrichtung", Drawings 24-24-3 / 24-24-4), radii around the ring axis.
+# The ring segment is fixed (moves only with h) and sits BEHIND the camera; the carriage with
+# pinion (16 z) runs on the internal gear (120 z, m=2) and carries the camera, so camera and
+# carriage rotate rigidly about the ring axis (= pivot, 38 mm in front of the lens).
+RING_R_OUT, RING_R_IN, RING_HALF_DEG, RING_T = 156.5, 140.0, 61.5, 21.0
+GEAR_R_ROOT, GEAR_R_TIP, GEAR_HALF_DEG, GEAR_PITCH_DEG, GEAR_T = 122.5, 118.0, 78.0, 3.0, 16.0
+PINION_R, PINION_RADIUS_TIP = 104.0, 18.0  # pinion axis radius from ring axis, pinion tip radius
+ROLLER_R, ROLLER_HALF_DEG, ROLLER_RADIUS = 173.5, 9.0, 12.0  # outer V-rollers on the ring rim
+RING_COLOR, GEAR_COLOR, CARRIAGE_COLOR = "#cbd5e1", "#64748b", "#475569"
 FRUSTUM_FALLBACK_LEN = 400.0
 
 DEFAULT_TARGETS = """[
@@ -113,6 +123,26 @@ def _ensure_stl_route(rig: RigModel) -> None:
         return Response(content=data, media_type="model/stl")
 
     _stl_route_ready = True
+
+
+def _ring_pt(s: int, r: float, phi_deg: float) -> list[float]:
+    """Point in the ring plane (x-z, relative to the pivot). phi=0 points away from the specimen,
+    positive phi upward; a carriage at phi = -theta carries a camera tilted by theta."""
+    ph = math.radians(phi_deg)
+    return [s * r * math.cos(ph), 0.0, r * math.sin(ph)]
+
+
+def _arc(s: int, r: float, a0: float, a1: float, n: int = 48) -> list[list[float]]:
+    return [_ring_pt(s, r, a0 + (a1 - a0) * i / n) for i in range(n + 1)]
+
+
+def _circle(center: list[float], r: float, n: int = 20) -> list[list[float]]:
+    """Circle in the x-z plane (the ring plane)."""
+    cx, cy, cz = center
+    return [
+        [cx + r * math.cos(2 * math.pi * i / n), cy, cz + r * math.sin(2 * math.pi * i / n)]
+        for i in range(n + 1)
+    ]
 
 
 def _rot_cols(x: kin.Vec3, y: kin.Vec3, z: kin.Vec3) -> list[list[float]]:
@@ -376,10 +406,14 @@ class TwinPage:
 
         with self.scene.group() as g:
             self.groups[cam] = g
-            # pivot axis (horizontal, parallel to y): three.js cylinders point along scene y
-            self.scene.cylinder(7, 7, 80, 20).material("#334155")
-            # arm to the rail + carriage
-            self.scene.box(RAIL_OFFSET, 12, 12).move(s * RAIL_OFFSET / 2, 0, 0).material("#64748b")
+            # ring axis (= tilt pivot): virtual axis, no physical shaft -> thin line along y
+            self.scene.polyline([[0, -70, 0], [0, 70, 0]]).material("#334155")
+            self._build_ring(s)
+            # bracket ring -> linear carriage on the rail (geometry estimated)
+            arm = RAIL_OFFSET - RING_R_OUT
+            self.scene.box(arm, 12, 12).move(s * (RING_R_OUT + arm / 2), 0, 0).material(
+                "#64748b"
+            )
             self.scene.box(30, 60, 40).move(s * RAIL_OFFSET, 0, 0).material(color)
             # tilt range: arc of the optical axis + limit rays (soft = amber, switch = red)
             n = 40
@@ -407,6 +441,27 @@ class TwinPage:
         for z in (lo, hi):
             self.scene.box(16, 60, 3).move(rail_x, 0, z).material("#991b1b")
 
+    def _build_ring(self, s: int) -> None:
+        """Fixed guide-ring segment + internal gear segment (inside the per-camera group)."""
+        n = 60
+        ring = _arc(s, RING_R_OUT, -RING_HALF_DEG, RING_HALF_DEG, n)
+        ring += _arc(s, RING_R_IN, RING_HALF_DEG, -RING_HALF_DEG, n)
+        teeth: list[list[float]] = [_ring_pt(s, RING_R_IN, -GEAR_HALF_DEG)]
+        k = int(round(2 * GEAR_HALF_DEG / GEAR_PITCH_DEG))
+        for i in range(k + 1):
+            a = -GEAR_HALF_DEG + i * GEAR_PITCH_DEG
+            teeth.append(_ring_pt(s, GEAR_R_ROOT, a - GEAR_PITCH_DEG / 4))
+            teeth.append(_ring_pt(s, GEAR_R_TIP, a))
+            teeth.append(_ring_pt(s, GEAR_R_ROOT, a + GEAR_PITCH_DEG / 4))
+        teeth += _arc(s, RING_R_IN, GEAR_HALF_DEG, -GEAR_HALF_DEG, n)
+        # extrude the (x, z) outlines along y: local x->x, local y->z, local z->-y
+        rot = _rot_cols((1, 0, 0), (0, 0, 1), (0, -1, 0))
+        for outline, depth, col in ((ring, RING_T, RING_COLOR), (teeth, GEAR_T, GEAR_COLOR)):
+            shape = [[p[0], p[2]] for p in outline]
+            self.scene.extrusion(shape, depth).move(0, depth / 2, 0).rotate_R(rot).material(
+                col, 0.9, side="both"
+            )
+
     # --- dynamic scene ----------------------------------------------------------------------
 
     def _redraw(self, cam: str) -> None:
@@ -431,7 +486,8 @@ class TwinPage:
                 .rotate_R(_rot_cols(pose.right, pose.up, kin.vscale(d, -1)))
                 .material(color, 0.9)
             )
-            objs.append(self.scene.sphere(9).move(*pose.lens).material("#0f172a"))
+            objs.append(self.scene.sphere(6).move(*pose.lens).material("#0f172a"))
+            objs += self._draw_carriage(s, pose)
             end = hit.point if hit.hit else kin.vadd(pose.lens, kin.vscale(d, FRUSTUM_FALLBACK_LEN))
             objs.append(self.scene.polyline([list(pose.lens), list(end)]).material("#111827"))
             if hit.hit:
@@ -453,6 +509,48 @@ class TwinPage:
                 )
                 objs.append(fill)
         self.dyn[cam] = objs
+
+    def _draw_carriage(self, s: int, pose: kin.CameraPose) -> list[Any]:
+        """Carriage on the ring at phi = -theta: pinion, outer rollers, plate, camera bracket."""
+        px, _, pz = pose.pivot
+        theta = math.degrees(math.atan2(pose.direction[2], -s * pose.direction[0]))
+
+        def w(r: float, phi: float) -> list[float]:
+            q = _ring_pt(s, r, phi)
+            return [q[0] + px, q[1], q[2] + pz]
+
+        objs: list[Any] = []
+        objs.append(
+            self.scene.polyline(_circle(w(PINION_R, -theta), PINION_RADIUS_TIP)).material(
+                CARRIAGE_COLOR
+            )
+        )
+        for dphi in (-ROLLER_HALF_DEG, ROLLER_HALF_DEG):
+            objs.append(
+                self.scene.polyline(_circle(w(ROLLER_R, -theta + dphi), ROLLER_RADIUS)).material(
+                    CARRIAGE_COLOR
+                )
+            )
+        # carriage plate spanning pinion .. rollers, oriented radially (local z = radial)
+        radial = kin.vscale(pose.direction, -1)
+        r_mid = (PINION_R + ROLLER_R) / 2
+        objs.append(
+            self.scene.box(70, 70, ROLLER_R - PINION_R + 30)
+            .move(*w(r_mid, -theta))
+            .rotate_R(_rot_cols(pose.right, pose.up, radial))
+            .material(CARRIAGE_COLOR, 0.55)
+        )
+        # bracket carriage -> camera housing (along the optical axis, behind the lens)
+        back = kin.vadd(pose.lens, kin.vscale(pose.direction, -BODY[2]))
+        r_back = math.dist(back, pose.pivot)
+        length = max(PINION_R - 15 - r_back, 1.0)
+        objs.append(
+            self.scene.box(20, 20, length)
+            .move(*w(r_back + length / 2, -theta))
+            .rotate_R(_rot_cols(pose.right, pose.up, radial))
+            .material(CARRIAGE_COLOR)
+        )
+        return objs
 
     # --- updating ---------------------------------------------------------------------------
 
