@@ -64,6 +64,10 @@ class TinkerforgeDrive(BaseDrive):
         # Start at 0 — actual position unknown until calibrated
         self._current_position = 0.0
 
+    @property
+    def supports_angle_feedback(self) -> bool:
+        return True
+
     async def setup(self) -> None:
         if self._simulated:
             logger.info("tinkerforge_drive.setup_simulated", key=self.key, uid=self.uid)

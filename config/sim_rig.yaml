@@ -46,7 +46,7 @@ cameras:
       height_px: 1080
     imu:
       roll_sign: 1
-      roll_offset_deg: 0    # PLACEHOLDER Einbau-Offset (reale cam1 liest ca. -90 deg bei Tilt 0?)
+      roll_offset_deg: -90  # cam1 kopfüber montiert -> liest ca. -90 deg (imu_calibration.yaml); am Aufbau prüfen
       pitch_offset_deg: 0
 
   cam2:                  # Rückseite / back face (-x), spiegelsymmetrisch
@@ -76,5 +76,5 @@ cameras:
       height_px: 1080
     imu:
       roll_sign: 1
-      roll_offset_deg: 0
+      roll_offset_deg: 90   # cam2 aufrecht -> ca. +90 deg; am Aufbau prüfen
       pitch_offset_deg: 0

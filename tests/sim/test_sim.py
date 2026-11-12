@@ -9,15 +9,15 @@ import pytest
 from src.sim import RigModel
 from src.sim import kinematics as kin
 from src.sim.fov import footprint
-from src.sim.rig_config import load_rig_config
 from src.sim.specimen import Specimen
+from tests.sim.conftest import neutral_rig_config
 
 CAMS = ["cam1", "cam2"]
 
 
 @pytest.fixture(scope="module")
 def rig_cfg():
-    return load_rig_config()
+    return neutral_rig_config()
 
 
 @pytest.fixture()

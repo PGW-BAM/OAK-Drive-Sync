@@ -144,6 +144,15 @@ class BaseDrive(ABC):
         return False
 
     @property
+    def supports_angle_feedback(self) -> bool:
+        """True if closed-loop IMU angle convergence (target_angle_deg) runs on this drive.
+
+        Capability flag instead of ``isinstance(drive, TinkerforgeDrive)`` checks, so
+        simulated radial drives (src/sim/drives.py) can take part. Default: False.
+        """
+        return False
+
+    @property
     def setup_error(self) -> str | None:
         """Human-readable reason why setup failed, or None."""
         return None

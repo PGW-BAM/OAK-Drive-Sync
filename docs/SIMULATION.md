@@ -58,3 +58,76 @@ Vorderseite bei x = +t/2, Rückseite bei x = −t/2. Seite s = +1 (cam1) / −1 
 ```bash
 python -m pytest tests/sim -q
 ```
+
+## Schritt 2: Pi-Steuerung gegen die Simulation
+
+Die bestehende Pi-Logik (`DriveManager`, `DriftDetector.converge`, Auto-Kalibrierung) läuft unverändert
+gegen simulierte Antriebe und eine simulierte Kamera-IMU. Die Simulation schreibt die Schrittpositionen
+in das gemeinsame `RigModel`, daher folgen Pose und IMU-Winkel der Bewegung.
+
+### Starten
+
+Voraussetzung: ein Mosquitto-Broker (z. B. `mosquitto -p 1883` lokal), Host/Port in der Config.
+
+```bash
+oak-pi run --sim --no-gui            # nutzt config/drive_config.sim.yaml
+OAK_SIM=1 oak-pi run                 # gleichwertig (Umgebungsvariable)
+oak-pi run --config config/drive_config.sim.yaml
+```
+
+- `--sim` / `OAK_SIM=1` setzt nur den Config-Default auf `config/drive_config.sim.yaml`.
+  Der Sim-Modus selbst wird durch den Top-Level-Schlüssel `sim:` in der Config aktiviert.
+- Drive-Typen: `type: sim_linear` (Achse a, wie `GPIODrive`: Position in *Einheiten*,
+  Schritte = Einheiten × `steps_per_unit`) und `type: sim_radial` (Achse b, wie `TinkerforgeDrive`:
+  Position = rohe Schritte). Hardware-Schlüssel (`step_pin`, `uid`, ...) werden akzeptiert und ignoriert.
+- Der Prozess startet zusätzlich einen `SimImuResponder` (eigene MQTT-Verbindung `oak-sim-imu`), der die
+  Windows-Kamera-IMU ersetzt: 2 Hz Telemetrie auf `telemetry/cam/{cam}/imu` und Antworten auf
+  `cmd/cam/{cam}/imu_check` (mit `request_id`).
+- **Achtung Arbeitsverzeichnis:** `data/drive_positions.jsonl`, `config/calibration.yaml`,
+  `config/imu_calibration.yaml` und `config/positions.yaml` sind relativ zum CWD fest verdrahtet und werden
+  auch im Sim-Modus beschrieben. Sim deshalb aus einem Scratch-Verzeichnis mit Kopie von `config/` starten.
+- Die Auto-Kalibrierung erwartet reale Einbaulagen (cam1 ≈ −90°, cam2 ≈ +90° bei Tilt 0). Dafür in einer
+  Kopie von `sim_rig.yaml` `imu.roll_offset_deg: -90` (cam1) bzw. `90` (cam2) setzen und per
+  `sim.rig_config` verwenden; dann läuft sie in der Sim erfolgreich durch (geprüft). Mit Offset 0 schlägt sie
+  erwartungsgemäß fehl (Ziel ±90° nicht erreichbar), die Steuerung läuft trotzdem weiter.
+
+### Was simuliert wird
+
+- Bewegungsdauer aus `max_speed` bzw. `max_velocity` (Schritte/s, skaliert mit `speed`), optional Trapez-Profil
+  (`acceleration`/`deceleration`), asynchron, Position alle `update_interval_s` (Default 20 ms) aktualisiert.
+- `emergency_stop()` mitten in der Bewegung (Position friert zum Stopp-Zeitpunkt ein, State IDLE).
+- Soft-Min/Max und `calibration_mode` wie in den echten Treibern (GPIO: unteres Limit immer, oberes nur
+  außerhalb `calibration_mode`; Tinkerforge: beide, in `calibration_mode` keine). Defaults = Soft-Limits aus
+  `sim_rig.yaml`, überschreibbar mit `home_position`/`max_position` bzw. `min_position`/`max_position`.
+- Virtuelle Endschalter (`switch_min/max` bzw. Überlauf aus `sim_rig.yaml`) wirken auf die *physische*
+  Position: Stopp am Schalter, State `FAULT`, `drive.triggered_switch` = `"min"`/`"max"` (physikalischer Sinn,
+  unabhängig von `direction_sign`). Das nächste `move_to` quittiert den Fehler.
+- Fehlerinjektion (Default aus): `step_loss_fraction` (Anteil verlorener Schritte; der Zähler merkt nichts) und
+  `backlash_steps` (Spiel bei jeder Richtungsumkehr). `set_current_position`/`seed_position` ändern nur den
+  Zähler, nicht die physische Position (wie beim Resync der echten Hardware).
+- `SimImuResponder`: `noise_deg` (Gauß), `settle_tau_s` (Tiefpass-Nachschwingen), `rate_hz`.
+- `FakeBroker`/`FakeMQTTClient` (`src/sim/fake_mqtt.py`) für Tests ohne Mosquitto: Wildcards, Retained,
+  `dispatch="serial"` (wie der echte `MQTTClient`: Handler werden inline awaited) oder `"concurrent"`.
+
+### Fähigkeits-Property statt `isinstance`
+
+`BaseDrive.supports_angle_feedback` (Default `False`; `True` für `TinkerforgeDrive` und `SimRadialDrive`)
+ersetzt in `main.py` die Prüfungen `isinstance(drive, TinkerforgeDrive)`. Der `_simulated`-Check der
+Auto-Kalibrierung bleibt (Tinkerforge ohne Bricklet-Bibliothek wird weiter übersprungen); Sim-Radialantriebe
+setzen `_simulated = False`.
+
+### Bekannte Einschränkungen
+
+- **Bekannter Bug (nicht behoben):** `MQTTClient.run` awaited jeden Handler inline. `handle_move` → `converge`
+  wartet auf die `imu_check`-Antwort, die derselbe Empfangsloop liefern müsste → Timeout, `converge` schlägt
+  fehl (FAULT). Im Test: `test_e2e_angle_move_serial_dispatch` (`xfail strict`) vs.
+  `test_e2e_angle_move_concurrent_dispatch` (grün). Mit `--sim` gegen einen echten Broker tritt der Fehler
+  daher ebenfalls auf, bis der Client Handler nebenläufig ausführt.
+- Kein Stall/Motorstrom-Modell, kein Mechanik-Nachschwingen (nur der IMU-Tiefpass), keine Thermik.
+- Reale GPIO-Sicherheitszeiten (`direction_change_delay`, `min_move_interval`) und `pulse_delay` werden nicht
+  nachgebildet; `speed` wirkt in der Sim (beim echten `GPIODrive` wird es ignoriert).
+- `DriveManager` meldet bei Endschalter-FAULT im offenen Pfad keinen `DriveError` (`limit_switch`); der State
+  `fault` steht nur im Positions-Status.
+- Der Fake-Broker simuliert weder QoS noch LWT noch Reconnects; `stop()` beendet `run()` sofort.
+- `_setup_controller` erzeugt einen echten `MQTTClient` (nicht injizierbar); der E2E-Test baut die gleiche
+  Verdrahtung daher nach.
