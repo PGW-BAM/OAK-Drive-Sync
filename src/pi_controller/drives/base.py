@@ -31,6 +31,9 @@ class BaseDrive(ABC):
         self._target_position: float | None = None
         self._move_lock = asyncio.Lock()
         self.calibration_mode: bool = False
+        # Hard (min, max) envelope still enforced while calibration_mode bypasses the soft
+        # limits. Set by DriftDetector.converge from the calibrated range; None = unbounded.
+        self.hard_envelope: tuple[float, float] | None = None
         self.min_calibrated: bool = False
         self.max_calibrated: bool = False
 

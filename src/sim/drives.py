@@ -466,6 +466,9 @@ class SimRadialDrive(_SimAxisDrive):
 
     def _clamp_target(self, position: float) -> float:
         if self.calibration_mode:
+            if self.hard_envelope is not None:  # same semantics as TinkerforgeDrive
+                lo, hi = self.hard_envelope
+                position = max(lo, min(hi, position))
             return float(int(position))
         return float(int(max(self._min_position, min(self._max_position, position))))
 

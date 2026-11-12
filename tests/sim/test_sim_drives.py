@@ -487,7 +487,10 @@ async def _run_e2e(dispatch: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatc
             ),
             timeout=5.0,
         )
-        final = [s for s in statuses if s["sequence_id"] == "e2e-1"][-1]
+        mine = [s for s in statuses if s["sequence_id"] == "e2e-1"]
+        # First status for a new command must say MOVING, never a stale REACHED.
+        assert mine[0]["state"] == "moving"
+        final = mine[-1]
         assert final["state"] == "reached"
         assert rig.imu_angles("cam1")[0] == pytest.approx(10.0, abs=0.25)
         assert mgr.drives["cam1:b"].state == DriveState.REACHED
@@ -501,13 +504,50 @@ async def _run_e2e(dispatch: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
 @pytest.mark.xfail(
     strict=True,
-    reason="known bug: MQTTClient awaits handlers inline -> imu_check reply cannot be "
-    "dispatched during converge",
+    reason="OLD MQTTClient behaviour (fixed by TopicDispatcher): handlers awaited inline -> "
+    "imu_check reply cannot be dispatched during converge",
 )
 async def test_e2e_angle_move_serial_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await _run_e2e("serial", tmp_path, monkeypatch)
+
+
+async def test_e2e_angle_move_per_topic_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fixed MQTTClient dispatch (TopicDispatcher): converge gets its IMU replies."""
+    await _run_e2e("per_topic", tmp_path, monkeypatch)
+
+
+async def test_per_topic_dispatch_stop_overtakes_running_move() -> None:
+    """/stop must be handled while a /move handler is still running; moves stay ordered."""
+    broker = FakeBroker()
+    c = broker.client("pi")  # default = per_topic, same dispatcher as MQTTClient
+    log: list[str] = []
+    stop_seen = asyncio.Event()
+
+    async def on_move(topic: str, payload: dict) -> None:
+        log.append(f"move{payload['n']}_start")
+        if payload["n"] == 1:
+            await asyncio.wait_for(stop_seen.wait(), timeout=1.0)
+        log.append(f"move{payload['n']}_end")
+
+    async def on_stop(topic: str, payload: dict) -> None:
+        log.append("stop")
+        stop_seen.set()
+
+    c.subscribe("cmd/drives/+/move", on_move)
+    c.subscribe("cmd/drives/+/stop", on_stop)
+    task = asyncio.create_task(c.run())
+    await c._connected.wait()
+    await c.publish("cmd/drives/cam1/move", {"n": 1})
+    await c.publish("cmd/drives/cam1/move", {"n": 2})
+    await c.publish("cmd/drives/cam1/stop", {})
+    await _eventually(lambda: "move2_end" in log)
+    await c.stop()
+    await task
+    assert log == ["move1_start", "stop", "move1_end", "move2_start", "move2_end"]
 
 
 async def test_e2e_angle_move_concurrent_dispatch(
@@ -530,3 +570,17 @@ def test_sim_mode_never_writes_real_state_files(tmp_path, monkeypatch):
     assert imu_path != pi_main.REAL_IMU_CALIBRATION
     assert imu_path.exists()  # seeded from the real file as template
     assert pi_main._imu_calibration_path({}) == pi_main.REAL_IMU_CALIBRATION
+
+
+async def test_calibration_mode_respects_hard_envelope() -> None:
+    """converge lifts soft limits but a hard envelope must still clamp runaway targets."""
+    from src.sim.drives import SimRadialDrive
+
+    rig = neutral_rig()
+    drive = SimRadialDrive("cam1", "b", rig=rig, max_velocity=10_000_000, acceleration=0)
+    await drive.setup()
+    drive.calibration_mode = True
+    drive.hard_envelope = (-500.0, 500.0)
+    await drive.move_to(1_000_000)
+    assert drive.current_position <= 500.0
+    drive.hard_envelope = None

@@ -144,6 +144,9 @@ class TinkerforgeDrive(BaseDrive):
         async with self._move_lock:
             if self.calibration_mode:
                 target = int(position)
+                if self.hard_envelope is not None:
+                    lo, hi = self.hard_envelope
+                    target = int(max(lo, min(hi, target)))
             else:
                 target = int(max(self._min_position, min(self._max_position, position)))
             self._target_position = float(target)

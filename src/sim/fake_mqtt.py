@@ -6,9 +6,11 @@
 
 Faithfulness notes (reproduces the real client on purpose)
 ----------------------------------------------------------
-* ``dispatch="serial"`` (default): like ``MQTTClient.run`` the receive loop *awaits each
-  handler inline*. A handler that waits for another incoming message on the SAME client
-  (e.g. ``DriveManager.handle_move`` -> ``converge`` -> ``request_imu_check``) therefore
+* ``dispatch="per_topic"`` (default): uses the same ``TopicDispatcher`` as
+  ``MQTTClient.run`` (ordered per topic, concurrent across topics).
+* ``dispatch="serial"``: the OLD real-client behaviour, kept to document the bug - the
+  receive loop *awaits each handler inline*. A handler that waits for another incoming
+  message on the SAME client (e.g. ``DriveManager.handle_move`` -> ``converge`` -> ``request_imu_check``) therefore
   blocks the loop and the awaited reply cannot be dispatched until the wait times out.
   ``dispatch="concurrent"`` runs every handler as its own task (the fix).
 * Payloads are JSON round-tripped (``model_dump_json`` / ``json.loads``) like the real wire.
@@ -29,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar
 import structlog
 from pydantic import BaseModel
 
-from src.shared.mqtt_client import MessageHandler, _topic_matches
+from src.shared.mqtt_client import MessageHandler, TopicDispatcher, _topic_matches
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -38,7 +40,7 @@ logger = structlog.get_logger()
 
 T = TypeVar("T", bound=BaseModel)
 
-Dispatch = Literal["serial", "concurrent"]
+Dispatch = Literal["per_topic", "serial", "concurrent"]
 
 
 class FakeBroker:
@@ -50,7 +52,7 @@ class FakeBroker:
         self._clients: list[FakeMQTTClient] = []
 
     def client(
-        self, client_id: str, *, dispatch: Dispatch = "serial", **kwargs: Any
+        self, client_id: str, *, dispatch: Dispatch = "per_topic", **kwargs: Any
     ) -> FakeMQTTClient:
         c = FakeMQTTClient(self, client_id=client_id, dispatch=dispatch, **kwargs)
         self._clients.append(c)
@@ -85,14 +87,14 @@ class FakeMQTTClient:
         broker: FakeBroker,
         *,
         client_id: str,
-        dispatch: Dispatch = "serial",
+        dispatch: Dispatch = "per_topic",
         broker_host: str = "fake",
         broker_port: int = 0,
         lwt_topic: str | None = None,
         lwt_payload: dict[str, Any] | None = None,
     ) -> None:
-        if dispatch not in ("serial", "concurrent"):
-            raise ValueError(f"dispatch must be 'serial' or 'concurrent', got {dispatch!r}")
+        if dispatch not in ("per_topic", "serial", "concurrent"):
+            raise ValueError(f"invalid dispatch mode {dispatch!r}")
         self.broker = broker
         self.client_id = client_id
         self.dispatch = dispatch
@@ -107,6 +109,7 @@ class FakeMQTTClient:
         self._connected = asyncio.Event()
         self._stop = asyncio.Event()
         self._tasks: set[asyncio.Task[None]] = set()
+        self._dispatcher = TopicDispatcher()
 
     @property
     def connected(self) -> bool:
@@ -146,6 +149,9 @@ class FakeMQTTClient:
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("fake_mqtt.invalid_json", topic=topic_str)
                     continue
+                if self.dispatch == "per_topic":  # exactly what MQTTClient.run does
+                    self._dispatcher.dispatch(self._subscriptions, topic_str, payload)
+                    continue
                 for topic_filter, handler in list(self._subscriptions.items()):
                     if not _topic_matches(topic_filter, topic_str):
                         continue
@@ -160,6 +166,7 @@ class FakeMQTTClient:
         finally:
             for task in list(self._tasks):
                 task.cancel()
+            await self._dispatcher.close()
             self._connected.clear()
             self._broker_filters = set()
 

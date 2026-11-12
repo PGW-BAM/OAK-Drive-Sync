@@ -135,8 +135,11 @@ class DriveManager:
 
         logger.info("drive.move_start", key=key, target=target, speed=speed, seq=sequence_id)
 
-        # Publish moving state
-        await self._publish_position(drive, sequence_id)
+        # Publish moving state explicitly: drive.state is still the PREVIOUS move's
+        # REACHED here, which the Windows orchestrator would take as "arrived".
+        await self._publish_position(
+            drive, sequence_id, state=DriveState.MOVING, target_position=float(target)
+        )
 
         target_angle_deg = payload.get("target_angle_deg")
         active_angle = payload.get("active_angle")
@@ -224,7 +227,7 @@ class DriveManager:
         sequence_id = payload.get("sequence_id")
         logger.info("drive.homing", key=key)
 
-        await self._publish_position(drive, sequence_id)
+        await self._publish_position(drive, sequence_id, state=DriveState.HOMING)
 
         try:
             await drive.home()
@@ -261,14 +264,23 @@ class DriveManager:
                 await self._publish_position(drive, sequence_id)
                 logger.warning("drive.stopped", key=key)
 
-    async def _publish_position(self, drive: BaseDrive, sequence_id: str | None = None) -> None:
+    async def _publish_position(
+        self,
+        drive: BaseDrive,
+        sequence_id: str | None = None,
+        *,
+        state: DriveState | None = None,
+        target_position: float | None = None,
+    ) -> None:
         from src.pi_controller.position_log import append_position_entry
         pos = DrivePosition(
             sequence_id=sequence_id,
             drive_axis=drive.axis,
             current_position=drive.current_position,
-            target_position=drive.target_position,
-            state=drive.state.value,
+            target_position=(
+                target_position if target_position is not None else drive.target_position
+            ),
+            state=(state or drive.state).value,
         )
         await self.mqtt.publish(
             topic(STATUS_DRIVE_POSITION, cam_id=drive.cam_id),
