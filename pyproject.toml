@@ -37,6 +37,10 @@ camera = [
     "opencv-python>=4.9.0",
     "numpy>=1.26.0",
 ]
+# Digital twin (src/sim) is pure Python; trimesh only for loading scanned specimen meshes
+sim = [
+    "trimesh>=4.0.0",
+]
 # All dependencies (development)
 dev = [
     "oak-drive-sync[pi,camera]",
