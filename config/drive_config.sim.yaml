@@ -1,0 +1,65 @@
+# OAK-Drive-Sync — Drive config for the DIGITAL TWIN (siehe docs/SIMULATION.md)
+# Start:  oak-pi run --sim        (oder: OAK_SIM=1 oak-pi run, oder --config <diese Datei>)
+# Same layout as drive_config.yaml; only `type` + sim parameters differ. Needs a Mosquitto
+# broker (broker.host below) — the Pi controller and the SimImuResponder talk MQTT over it.
+
+broker:
+  host: "localhost"
+  port: 1883
+
+settling_delay_ms: 150
+
+# Sim-only block. Presence of this key switches main.py into sim mode
+# (shared RigModel + SimImuResponder instead of the Windows camera IMU).
+sim:
+  rig_config: config/sim_rig.yaml     # geometry, steps/unit, limits, IMU mounting
+  state_dir: data/sim                 # ALL files written in sim mode go here (never config/)
+  imu:
+    rate_hz: 2.0                      # background telemetry rate (like the real camera)
+    noise_deg: 0.02                   # Gaussian sigma on roll/pitch; 0 = noiseless
+    settle_tau_s: 0.15                # accelerometer settle lag after a move; 0 = off
+
+drives:
+  cam1:
+    axis_a:
+      type: sim_linear                # mirrors GPIODrive: position in units, steps = units * steps_per_unit
+      steps_per_unit: 200
+      max_speed: 4000                 # steps/s at speed=1.0 (= 20 mm/s); faster than real for convenience
+      acceleration: 20000             # steps/s^2 (trapezoid); omit for constant velocity
+      update_interval_s: 0.02         # position update period (GUI animation)
+      post_move_delay: 0.05
+      dir_setup_delay: 0.010
+      step_loss_fraction: 0.0         # fraction of commanded steps that do NOT move the carriage
+      backlash_steps: 0               # play taken up on every direction reversal (steps)
+    axis_b:
+      type: sim_radial                # mirrors TinkerforgeDrive: position = raw steps
+      max_velocity: 20000             # steps/s at speed=1.0
+      acceleration: 40000
+      deceleration: 40000
+      motor_current: 1200
+      update_interval_s: 0.02
+      step_loss_fraction: 0.0
+      backlash_steps: 0
+      # min_position / max_position default to the rig soft limits (sim_rig.yaml)
+
+  cam2:
+    axis_a:
+      type: sim_linear
+      steps_per_unit: 200
+      max_speed: 4000
+      acceleration: 20000
+      update_interval_s: 0.02
+      post_move_delay: 0.05
+      dir_setup_delay: 0.010
+    axis_b:
+      type: sim_radial
+      max_velocity: 20000
+      acceleration: 40000
+      deceleration: 40000
+      motor_current: 1200
+      update_interval_s: 0.02
+
+gui:
+  host: "0.0.0.0"
+  port: 8080
+  title: "OAK Drive Controller (SIM)"

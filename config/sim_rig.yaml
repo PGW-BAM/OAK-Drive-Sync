@@ -1,0 +1,80 @@
+# OAK-Drive-Sync — Digital-Twin Rig-Konfiguration / digital twin rig config
+# Einheiten / units: mm, Grad / degrees. Koordinatensystem: siehe docs/SIMULATION.md
+#
+# PLACEHOLDER = Platzhalter, noch NICHT gemessen/verifiziert.
+
+specimen:
+  length: 600            # L, kann je Probe um ±100 variieren / may vary ±100 per specimen
+  grip_width: 150        # B
+  gauge_width: 100       # b
+  thickness: 25          # t
+  fillet_radius: 200     # R — ESTIMATE / SCHÄTZWERT aus Zeichnung (ergibt ~156 mm Parallellänge)
+  clamp_length: 125      # eingespannte Länge je Ende / clamped length per end
+  bead:                  # PLACEHOLDER Schweißwulst, bis Scan-Daten vorliegen
+    profile: cos2        # cos2 | ellipse
+    height: 2.0
+    width: 19.0
+
+cameras:
+  cam1:                  # Vorderseite / front face (+x)
+    side: 1
+    working_distance: 300   # Linse -> Oberfläche bei Tilt 0 (konfigurierbar)
+    lens_to_pivot: 38       # Linse sitzt 38 mm hinter der Pivot-Achse
+    axis_a:                 # vertikaler Linearantrieb (GPIO), Einheit mm = Höhe h
+      steps_per_unit: 200   # PLACEHOLDER steps/mm (unbekannt)
+      direction_sign: 1
+      zero_offset_steps: 0
+      travel_min: -150      # PLACEHOLDER Hub um Schweißnaht-Höhe / stroke around weld height
+      travel_max: 150
+      soft_margin: 5        # PLACEHOLDER
+      switch_overtravel: 3  # PLACEHOLDER virtuelle Endschalter knapp außerhalb des Hubs
+    axis_b:                 # Tilt (Tinkerforge), Einheit Grad
+      # 200 Vollschritte * 8 Mikroschritte / 0.8 deg pro Motorumdrehung
+      # (Schnecke 1-gängig -> Rad 60 Z; Ritzel 16 Z auf Innenzahnkranz 120 Z, m=2)
+      # Wird später durch Kalibrierung überschrieben / to be overwritten by calibration.
+      steps_per_unit: 2000
+      direction_sign: 1     # cam1 +1 (wie imu_calibration.yaml)
+      zero_offset_steps: 0
+      travel_min: -52       # aus CAD, konservativ
+      travel_max: 52
+      soft_margin: 1        # PLACEHOLDER
+      switch_overtravel: 1  # PLACEHOLDER
+    fov:                    # PLACEHOLDER — gegen Datenblatt OAK-D 4 Pro + aktiven Sensor/Auflösung prüfen!
+      hfov_deg: 69
+      vfov_deg: 55
+      width_px: 1920
+      height_px: 1080
+    imu:
+      roll_sign: 1
+      roll_offset_deg: -90  # cam1 kopfüber montiert -> liest ca. -90 deg (imu_calibration.yaml); am Aufbau prüfen
+      pitch_offset_deg: 0
+
+  cam2:                  # Rückseite / back face (-x), spiegelsymmetrisch
+    side: -1
+    working_distance: 300
+    lens_to_pivot: 38
+    axis_a:
+      steps_per_unit: 200   # PLACEHOLDER
+      direction_sign: 1
+      zero_offset_steps: 0
+      travel_min: -150
+      travel_max: 150
+      soft_margin: 5
+      switch_overtravel: 3
+    axis_b:
+      steps_per_unit: 2000
+      direction_sign: -1    # cam2 -1 (wie imu_calibration.yaml)
+      zero_offset_steps: 0
+      travel_min: -52
+      travel_max: 52
+      soft_margin: 1
+      switch_overtravel: 1
+    fov:
+      hfov_deg: 69
+      vfov_deg: 55
+      width_px: 1920
+      height_px: 1080
+    imu:
+      roll_sign: 1
+      roll_offset_deg: 90   # cam2 aufrecht -> ca. +90 deg; am Aufbau prüfen
+      pitch_offset_deg: 0
