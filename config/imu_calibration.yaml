@@ -96,6 +96,7 @@ auto_calibration:
 # soft min/max envelope.
 convergence:
   max_iterations: 30                  # raised from 20 to match auto-cal budget
+  envelope_margin_deg: 5.0            # converge may exceed calibrated min/max by at most this
   max_step_per_iter: 400              # per-iteration motor-step clamp (~4°);
                                       # replaces max_correction_deg:20° to kill
                                       # the manual-angle overshoot (2400 steps

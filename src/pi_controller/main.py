@@ -9,8 +9,8 @@ Includes a NiceGUI web interface for non-programmers.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import click
 import structlog
@@ -30,9 +30,6 @@ from src.shared.models import (
 )
 from src.shared.mqtt_client import MQTTClient
 from src.shared.mqtt_topics import (
-    CMD_DRIVE_HOME,
-    CMD_DRIVE_MOVE,
-    CMD_DRIVE_STOP,
     ERROR_DRIVE,
     HEALTH_PI,
     STATUS_DRIVE_POSITION,
@@ -55,6 +52,12 @@ def create_drive(cam_id: str, axis: str, cfg: dict) -> BaseDrive:
         return GPIODrive(cam_id, axis, **cfg)
     elif drive_type == "tinkerforge":
         return TinkerforgeDrive(cam_id, axis, **cfg)
+    elif drive_type in ("sim_linear", "sim_radial"):
+        # Digital twin (docs/SIMULATION.md); imported lazily so real hardware runs never load it.
+        from src.sim.drives import SimLinearDrive, SimRadialDrive
+
+        sim_cls = SimLinearDrive if drive_type == "sim_linear" else SimRadialDrive
+        return sim_cls(cam_id, axis, **cfg)
     else:
         raise ValueError(f"Unknown drive type: {drive_type}")
 
@@ -132,8 +135,11 @@ class DriveManager:
 
         logger.info("drive.move_start", key=key, target=target, speed=speed, seq=sequence_id)
 
-        # Publish moving state
-        await self._publish_position(drive, sequence_id)
+        # Publish moving state explicitly: drive.state is still the PREVIOUS move's
+        # REACHED here, which the Windows orchestrator would take as "arrived".
+        await self._publish_position(
+            drive, sequence_id, state=DriveState.MOVING, target_position=float(target)
+        )
 
         target_angle_deg = payload.get("target_angle_deg")
         active_angle = payload.get("active_angle")
@@ -142,7 +148,7 @@ class DriveManager:
         angle_driven = (
             axis == "b"
             and self.drift_detector is not None
-            and isinstance(drive, TinkerforgeDrive)
+            and drive.supports_angle_feedback
             and target_angle_deg is not None
             and active_angle in ("roll", "pitch")
         )
@@ -184,7 +190,7 @@ class DriveManager:
                     axis == "b"
                     and self.drift_detector is not None
                     and payload.get("checkpoint_name")
-                    and isinstance(drive, TinkerforgeDrive)
+                    and drive.supports_angle_feedback
                 ):
                     # Legacy one-shot drift check (no target_angle_deg supplied).
                     await self.drift_detector.check_and_correct(
@@ -221,7 +227,7 @@ class DriveManager:
         sequence_id = payload.get("sequence_id")
         logger.info("drive.homing", key=key)
 
-        await self._publish_position(drive, sequence_id)
+        await self._publish_position(drive, sequence_id, state=DriveState.HOMING)
 
         try:
             await drive.home()
@@ -258,14 +264,23 @@ class DriveManager:
                 await self._publish_position(drive, sequence_id)
                 logger.warning("drive.stopped", key=key)
 
-    async def _publish_position(self, drive: BaseDrive, sequence_id: str | None = None) -> None:
+    async def _publish_position(
+        self,
+        drive: BaseDrive,
+        sequence_id: str | None = None,
+        *,
+        state: DriveState | None = None,
+        target_position: float | None = None,
+    ) -> None:
         from src.pi_controller.position_log import append_position_entry
         pos = DrivePosition(
             sequence_id=sequence_id,
             drive_axis=drive.axis,
             current_position=drive.current_position,
-            target_position=drive.target_position,
-            state=drive.state.value,
+            target_position=(
+                target_position if target_position is not None else drive.target_position
+            ),
+            state=(state or drive.state).value,
         )
         await self.mqtt.publish(
             topic(STATUS_DRIVE_POSITION, cam_id=drive.cam_id),
@@ -371,7 +386,7 @@ class DriveManager:
                             if (
                                 angle_target is not None
                                 and self.drift_detector is not None
-                                and isinstance(drive_b, TinkerforgeDrive)
+                                and drive_b.supports_angle_feedback
                             ):
                                 active_angle = self.drift_detector.get_active_angle(cam_id)
                                 logger.info(
@@ -446,7 +461,7 @@ class DriveManager:
                                 )
                             else:
                                 drive = self.drives.get(f"{cam_id}:b")
-                                if drive is None or not isinstance(drive, TinkerforgeDrive):
+                                if drive is None or not drive.supports_angle_feedback:
                                     logger.warning(
                                         "sequence.checkpoint_no_drive",
                                         cam_id=cam_id,
@@ -572,7 +587,7 @@ async def run_startup_autocal(
         # request/response IMU traffic which only works post-subscribe.
         try:
             await asyncio.wait_for(drift_detector._mqtt._connected.wait(), timeout=15.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("auto_calibrator.mqtt_not_connected")
             return
 
@@ -586,8 +601,10 @@ async def run_startup_autocal(
         for key, drive in list(drive_mgr.drives.items()):
             if not key.endswith(":b"):
                 continue
-            if not isinstance(drive, TinkerforgeDrive):
+            if not drive.supports_angle_feedback:
                 continue
+            # Tinkerforge drive without bricklet library = no real motion/IMU response.
+            # (src/sim drives set _simulated=False: they ARE closed-loop via SimImuResponder.)
             if getattr(drive, "_simulated", False):
                 logger.info("auto_calibrator.skip_simulated", key=key)
                 continue
@@ -681,7 +698,60 @@ def _load_config(config_path: str, broker_host: str | None, broker_port: int | N
     broker = config.get("broker", {})
     host = broker_host or broker.get("host", "localhost")
     port = broker_port or broker.get("port", 1883)
+    sim_cfg = config.get("sim")
+    if sim_cfg:
+        # Sim mode (config/drive_config.sim.yaml): shared RigModel must exist before drives do.
+        from src.sim.drives import get_shared_rig
+
+        get_shared_rig(sim_cfg.get("rig_config"))
+        _isolate_sim_state(sim_cfg)
     return config, host, port
+
+
+REAL_IMU_CALIBRATION = Path("config/imu_calibration.yaml")
+
+
+def _imu_calibration_path(config: dict) -> Path:
+    """imu_calibration.yaml in use; sim mode gets its own copy (never the real file)."""
+    sim_cfg = config.get("sim")
+    if not sim_cfg:
+        return REAL_IMU_CALIBRATION
+    return Path(sim_cfg.get("state_dir", "data/sim")) / "imu_calibration.yaml"
+
+
+def _isolate_sim_state(sim_cfg: dict) -> None:
+    """Redirect every file the controller writes to ``sim.state_dir`` (default data/sim).
+
+    A sim run must never touch the real calibration, position log or presets. The real
+    imu_calibration.yaml is copied once as a starting template.
+    """
+    import shutil
+
+    from src.pi_controller import position_log
+
+    state_dir = Path(sim_cfg.get("state_dir", "data/sim"))
+    state_dir.mkdir(parents=True, exist_ok=True)
+    imu_path = state_dir / "imu_calibration.yaml"
+    if not imu_path.exists() and REAL_IMU_CALIBRATION.exists():
+        shutil.copyfile(REAL_IMU_CALIBRATION, imu_path)
+    position_log.LOG_PATH = state_dir / "drive_positions.jsonl"
+    try:
+        from src.pi_controller import gui
+    except ImportError:  # NiceGUI not installed (headless sim)
+        pass
+    else:
+        gui.POSITIONS_FILE = state_dir / "positions.yaml"
+        gui.CALIBRATION_FILE = state_dir / "calibration.yaml"
+    logger.info("sim.state_isolated", state_dir=str(state_dir))
+
+
+def _sim_imu_task(config: dict, host: str, port: int):  # type: ignore[no-untyped-def]
+    """Coroutine running the simulated camera IMU (replaces the Windows camera in sim mode)."""
+    from src.sim.drives import get_shared_rig
+    from src.sim.imu import run_sim_imu
+
+    imu_cfg = (config.get("sim") or {}).get("imu") or {}
+    return run_sim_imu(get_shared_rig(), host, port, **imu_cfg)
 
 
 async def _setup_controller(config: dict, host: str, port: int) -> tuple[DriveManager, MQTTClient]:
@@ -697,7 +767,7 @@ async def _setup_controller(config: dict, host: str, port: int) -> tuple[DriveMa
     drive_mgr = DriveManager(config, mqtt)
     await drive_mgr.setup_all()
 
-    drift_detector = DriftDetector(mqtt, Path("config/imu_calibration.yaml"))
+    drift_detector = DriftDetector(mqtt, _imu_calibration_path(config))
     drive_mgr.drift_detector = drift_detector
     _hist_count = drift_detector.angle_history.count()
     logger.info("angle_history.loaded", total_entries=_hist_count)
@@ -741,6 +811,8 @@ async def run_controller_headless(
             tg.create_task(mqtt.run())
             tg.create_task(heartbeat_loop(mqtt, drive_mgr))
             tg.create_task(run_startup_autocal(drive_mgr, drive_mgr.drift_detector))
+            if config.get("sim"):
+                tg.create_task(_sim_imu_task(config, host, port))
     finally:
         await drive_mgr.cleanup_all()
 
@@ -752,7 +824,8 @@ def run_controller_with_gui(
 ) -> None:
     """Run with NiceGUI. NiceGUI owns the event loop; MQTT runs as background tasks."""
     from nicegui import app as nicegui_app
-    from src.pi_controller.gui import setup_gui, run_gui
+
+    from src.pi_controller.gui import run_gui, setup_gui
 
     config, host, port = _load_config(config_path, broker_host, broker_port)
 
@@ -772,7 +845,7 @@ def run_controller_with_gui(
     drive_mgr = DriveManager(config, mqtt)
 
     # DriftDetector is constructed synchronously (no asyncio objects in __init__)
-    drift_detector = DriftDetector(mqtt, Path("config/imu_calibration.yaml"))
+    drift_detector = DriftDetector(mqtt, _imu_calibration_path(config))
     drive_mgr.drift_detector = drift_detector
     _hist_count = drift_detector.angle_history.count()
     logger.info("angle_history.loaded", total_entries=_hist_count)
@@ -783,6 +856,14 @@ def run_controller_with_gui(
 
     # Register all GUI pages
     gui_cfg = setup_gui(drive_mgr, config, config.get("gui", {}), drift_detector=drift_detector)
+
+    if config.get("sim"):
+        # Digital twin: 3D view at /twin, bound to the shared RigModel; its move buttons go
+        # through drive_mgr's sim drives (see src/sim/view.py, docs/SIMULATION.md).
+        from src.sim.drives import get_shared_rig
+        from src.sim.view import register_twin_page
+
+        register_twin_page(get_shared_rig(), drive_mgr=drive_mgr)
 
     # Wire up MQTT command dispatch
     async def dispatch_command(topic_str: str, payload: dict) -> None:
@@ -809,6 +890,8 @@ def run_controller_with_gui(
         asyncio.create_task(mqtt.run())
         asyncio.create_task(heartbeat_loop(mqtt, drive_mgr))
         asyncio.create_task(run_startup_autocal(drive_mgr, drift_detector))
+        if config.get("sim"):
+            asyncio.create_task(_sim_imu_task(config, host, port))
         logger.info("background_tasks.started")
 
     async def on_shutdown() -> None:
@@ -842,8 +925,19 @@ def cli() -> None:
 @click.option("--broker-host", default=None, help="MQTT broker hostname (overrides config)")
 @click.option("--broker-port", default=None, type=int, help="MQTT broker port (overrides config)")
 @click.option("--no-gui", is_flag=True, default=False, help="Disable web GUI")
-def run(config: str, broker_host: str | None, broker_port: int | None, no_gui: bool) -> None:
+@click.option(
+    "--sim",
+    is_flag=True,
+    default=False,
+    envvar="OAK_SIM",
+    help="Run against the digital twin (src/sim) using config/drive_config.sim.yaml",
+)
+def run(
+    config: str, broker_host: str | None, broker_port: int | None, no_gui: bool, sim: bool
+) -> None:
     """Start the drive controller."""
+    if sim and config == "config/drive_config.yaml":
+        config = "config/drive_config.sim.yaml"
     logger.info("pi_controller.starting", config=config)
     if no_gui:
         asyncio.run(run_controller_headless(config, broker_host, broker_port))

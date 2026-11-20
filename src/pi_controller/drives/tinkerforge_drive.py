@@ -64,6 +64,10 @@ class TinkerforgeDrive(BaseDrive):
         # Start at 0 — actual position unknown until calibrated
         self._current_position = 0.0
 
+    @property
+    def supports_angle_feedback(self) -> bool:
+        return True
+
     async def setup(self) -> None:
         if self._simulated:
             logger.info("tinkerforge_drive.setup_simulated", key=self.key, uid=self.uid)
@@ -140,6 +144,9 @@ class TinkerforgeDrive(BaseDrive):
         async with self._move_lock:
             if self.calibration_mode:
                 target = int(position)
+                if self.hard_envelope is not None:
+                    lo, hi = self.hard_envelope
+                    target = int(max(lo, min(hi, target)))
             else:
                 target = int(max(self._min_position, min(self._max_position, position)))
             self._target_position = float(target)

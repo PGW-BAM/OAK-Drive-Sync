@@ -51,6 +51,7 @@ class MQTTClient:
         self._client: aiomqtt.Client | None = None
         self._connected = asyncio.Event()
         self._stop = asyncio.Event()
+        self._dispatcher = TopicDispatcher()
 
     @property
     def connected(self) -> bool:
@@ -126,17 +127,10 @@ class MQTTClient:
                             logger.warning("mqtt.invalid_json", topic=topic_str)
                             continue
 
-                        # Find matching handler (exact match or wildcard)
-                        for topic_filter, handler in self._subscriptions.items():
-                            if _topic_matches(topic_filter, topic_str):
-                                try:
-                                    await handler(topic_str, payload)
-                                except Exception:
-                                    logger.exception(
-                                        "mqtt.handler_error",
-                                        topic=topic_str,
-                                        handler=handler.__name__,
-                                    )
+                        # Never await handlers inline: a handler that waits for another
+                        # message (move -> converge -> imu_check reply) would deadlock the
+                        # receive loop, and /stop would queue behind a running move.
+                        self._dispatcher.dispatch(self._subscriptions, topic_str, payload)
 
             except aiomqtt.MqttError as e:
                 self._connected.clear()
@@ -154,6 +148,7 @@ class MQTTClient:
 
         self._connected.clear()
         self._client = None
+        await self._dispatcher.close()
         logger.info("mqtt.stopped")
 
     async def stop(self) -> None:
@@ -164,6 +159,61 @@ class MQTTClient:
     def parse_payload(payload: dict[str, Any], model: type[T]) -> T:
         """Parse a raw dict payload into a Pydantic model."""
         return model.model_validate(payload)
+
+
+class TopicDispatcher:
+    """Runs message handlers off the receive loop: ordered per topic, concurrent across topics.
+
+    Each concrete topic gets one worker task + FIFO queue, so e.g. successive
+    ``cmd/drives/cam1/move`` messages are still handled in arrival order (no overlapping
+    moves from one topic), while ``cmd/drives/cam1/stop`` and IMU telemetry/replies are
+    handled immediately even while a long move is running.
+    """
+
+    def __init__(self) -> None:
+        self._queues: dict[str, asyncio.Queue[tuple[MessageHandler, dict[str, Any]]]] = {}
+        self._workers: dict[str, asyncio.Task[None]] = {}
+
+    def dispatch(
+        self,
+        subscriptions: dict[str, MessageHandler],
+        topic_str: str,
+        payload: dict[str, Any],
+    ) -> None:
+        for topic_filter, handler in list(subscriptions.items()):
+            if not _topic_matches(topic_filter, topic_str):
+                continue
+            queue = self._queues.get(topic_str)
+            if queue is None:
+                queue = asyncio.Queue()
+                self._queues[topic_str] = queue
+                self._workers[topic_str] = asyncio.create_task(
+                    self._worker(topic_str, queue), name=f"mqtt-dispatch:{topic_str}"
+                )
+            queue.put_nowait((handler, payload))
+
+    @staticmethod
+    async def _worker(
+        topic_str: str, queue: asyncio.Queue[tuple[MessageHandler, dict[str, Any]]]
+    ) -> None:
+        while True:
+            handler, payload = await queue.get()
+            try:
+                await handler(topic_str, payload)
+            except Exception:
+                logger.exception(
+                    "mqtt.handler_error",
+                    topic=topic_str,
+                    handler=getattr(handler, "__name__", repr(handler)),
+                )
+
+    async def close(self) -> None:
+        workers = list(self._workers.values())
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        self._workers.clear()
+        self._queues.clear()
 
 
 def _topic_matches(topic_filter: str, topic: str) -> bool:

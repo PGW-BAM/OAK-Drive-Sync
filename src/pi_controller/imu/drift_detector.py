@@ -319,7 +319,16 @@ class DriftDetector:
         # Bypass the soft envelope — see original comment. Also lets the
         # seed pre-move land wherever the last visit to this angle parked.
         was_cal_mode = drive.calibration_mode
+        was_envelope = drive.hard_envelope
         drive.calibration_mode = True
+        # calibration_mode lifts the soft limits; keep a hard envelope around the calibrated
+        # range so a bad seed (stale reference_position) or Newton step cannot run away.
+        if drive.calibrated:
+            margin = float(conv.get("envelope_margin_deg", 5.0)) * abs(steps_per_deg)
+            drive.hard_envelope = (
+                drive.get_min_position() - margin,
+                drive.get_max_position() + margin,
+            )
         try:
             # ── Seed phase ──────────────────────────────────────────────
             # Open-loop pre-move to a best-guess position before the Newton
@@ -544,6 +553,7 @@ class DriftDetector:
             )
         finally:
             drive.calibration_mode = was_cal_mode
+            drive.hard_envelope = was_envelope
 
     async def _publish_converge_event(
         self,
