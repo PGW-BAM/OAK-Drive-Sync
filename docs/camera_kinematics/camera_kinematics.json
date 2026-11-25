@@ -1,0 +1,131 @@
+{
+  "version": "2026-11-25",
+  "model_source": "OAK-Drive-Sync src/sim/kinematics.py + config/sim_rig.yaml (digital twin); identical formulas in camera_pose.py",
+  "units": {
+    "length": "mm",
+    "angle": "deg (degrees) in all parameters and axis values; radians only internally"
+  },
+  "frame": {
+    "name": "specimen frame",
+    "handedness": "right-handed (x cross y = z)",
+    "origin": "centre of the weld seam on the specimen mid-plane (half thickness, half width, weld height)",
+    "x": "normal of the specimen FRONT face, pointing toward cam1 (cam2 looks at the back face from -x)",
+    "y": "across the specimen width (= z cross x); parallel to the ring/tilt axes",
+    "z": "up, along the specimen length axis (specimen clamped vertically, weld seam horizontal)",
+    "faces": "front face at x = +t/2 = +12.5, back face at x = -12.5 (t = 25); weld bead adds ~2 mm (placeholder)",
+    "gravity": "-z"
+  },
+  "axes": [
+    {
+      "name": "a",
+      "type": "linear (prismatic)",
+      "drive": "GPIO stepper on Raspberry Pi 5 (cam1:a, cam2:a)",
+      "direction": [0, 0, 1],
+      "variable": "h_mm = height of the ring axis (pivot) above the weld centre",
+      "range_mm": [-150, 150],
+      "range_status": "PLACEHOLDER - real stroke not yet provided; steps/mm unknown",
+      "chain_index": 1,
+      "parent": "base (rig frame, fixed to the machine; equals the specimen frame when the weld is at z = 0)"
+    },
+    {
+      "name": "b",
+      "type": "revolute",
+      "drive": "Tinkerforge Silent Stepper Bricklet 2.0 -> worm 1-start / wheel 60 z -> pinion 16 z on internal ring-gear segment 120 z (m = 2); ~0.8 deg carriage tilt per motor revolution",
+      "axis_direction": "parallel to y through the pivot P = (s*(t/2 + D_pivot), 0, h); positive rotation tilts the optical axis upward (+z) for both cameras",
+      "variable": "tilt_deg",
+      "range_deg": [-52, 52],
+      "range_status": "estimated from CAD (rollers on guide-ring rim, rim +-61.5 deg, teeth +-78 deg); not measured; limit switches not final",
+      "chain_index": 2,
+      "parent": "a"
+    }
+  ],
+  "cameras": {
+    "cam1": {"side_s": 1, "looks_at": "front face (+x side)"},
+    "cam2": {"side_s": -1, "looks_at": "back face (-x side), mirror of cam1"}
+  },
+  "transformation_chain": [
+    "T_base = identity (specimen frame)",
+    "T_a(h) = translation (s*(t/2 + D_pivot), 0, h) -> pivot P on the ring axis; D_pivot = working_distance - lens_to_pivot = 262 mm",
+    "T_b(theta) = rotation about +/-y through P such that forward d = (-s*cos(theta), 0, sin(theta)), up = (s*sin(theta), 0, cos(theta))",
+    "T_cam = translation by -lens_to_pivot along d -> optical centre O = P - 38*d",
+    "optional image roll about d: cam1 180 deg (mounted upside down per IMU calibration, UNVERIFIED), cam2 0 deg"
+  ],
+  "camera_mount_to_optical_center": {
+    "description": "Optical centre lies on the optical axis BEHIND the ring axis; the optical axis always passes through the ring axis (CAD: 3 mm miss distance).",
+    "lens_to_pivot_mm": 38.0,
+    "lateral_offset_mm": 0.0,
+    "vertical_offset_mm": 0.0,
+    "working_distance_mm": 300.0,
+    "working_distance_definition": "optical centre -> flat front face along the optical axis at tilt 0",
+    "note": "38 mm is measured in CAD from the ring axis to the front glass / centre lens of the OAK-D PoE enclosure (37.7-39.7 mm). The true entrance pupil of the IMX586 module lies a few mm further back (unknown). The Mitsuba setup uses 0.21 m; the operator gives ~0.30 m for current experiments - use the measured value of your reference photo.",
+    "camera_intrinsics_hint": "IMX586, 1920x1080, HFOV 67.3 deg per the Mitsuba project (the twin still uses a 69 x 55 deg placeholder)"
+  },
+  "pose_formula": {
+    "pivot": "P = (s*(t/2 + WD - L), 0, h)",
+    "forward": "d = (-s*cos(theta), 0, sin(theta))",
+    "up": "u = (s*sin(theta), 0, cos(theta))  [then rotate 180 deg about d for cam1 if the upside-down mount is confirmed]",
+    "origin": "O = P - L*d",
+    "hit_on_face_z": "z_hit = h + (WD - L)*tan(theta)  (flat face)",
+    "weld_centred_tilt": "h = -(WD - L)*tan(theta) keeps the optical axis on the weld centre",
+    "symbols": "s = +1 cam1 / -1 cam2, t = 25, WD = 300, L = 38, theta = tilt_deg"
+  },
+  "specimen_frame": {
+    "origin": "weld centre, mid-plane",
+    "longitudinal_axis": [0, 0, 1],
+    "normal_toward_cam1": [1, 0, 0],
+    "normal_toward_cam2": [-1, 0, 0],
+    "width_axis": [0, 1, 0],
+    "default_geometry_mm": {
+      "length": 600,
+      "grip_width": 150,
+      "gauge_width": 100,
+      "thickness": 25,
+      "fillet_radius_estimate": 200,
+      "clamped_length_per_end": 125,
+      "visible_free_length": 350,
+      "weld": "DV butt weld (UP), horizontal at z = 0; bead placeholder 2 mm high, 19 mm wide"
+    },
+    "clamping": "jaws cover z in [-300, -175] and [175, 300]",
+    "stl_alignment_hint": "align the 3D scan so that the weld centreline lies on the y axis at z = 0, specimen length along z, front face toward +x (cam1 side)"
+  },
+  "uv_lamps": {
+    "current_setup": null,
+    "current_setup_note": "Two UV lamps per specimen side are FIXED (not on the camera carriage, not enough space) and placed to illuminate the whole field. Their poses are not in any CAD/config available here - must be measured.",
+    "cad_reference_original_design": {
+      "status": "historical: original CAD design where the lamps rode on the camera carriage; NOT the current setup",
+      "lamps": [
+        {"name": "uv_left", "position_rel_camera_mm": {"along_optical_axis": 0.6, "image_right": -144.5, "image_up": -1.0}, "emission": "approximately parallel to the optical axis (dummy disc ~120 mm diameter; emission sign inferred)"},
+        {"name": "uv_right", "position_rel_camera_mm": {"along_optical_axis": 0.6, "image_right": 145.5, "image_up": -1.0}, "emission": "approximately parallel to the optical axis"}
+      ]
+    }
+  },
+  "reference_poses": {
+    "frontal_weld_cam1": {"cam": "cam1", "h_mm": 0.0, "tilt_deg": 0.0, "origin_mm": [312.5, 0.0, 0.0], "forward": [-1, 0, 0]},
+    "frontal_weld_cam2": {"cam": "cam2", "h_mm": 0.0, "tilt_deg": 0.0, "origin_mm": [-312.5, 0.0, 0.0], "forward": [1, 0, 0]},
+    "probe_9_2_reference_photo": {
+      "cam": "cam1 (assumed; please confirm which side)",
+      "h_mm": 0.0,
+      "tilt_deg": 0.0,
+      "status": "NOMINAL: 'frontal, ~30 cm'. No logged axis values exist for this photo."
+    },
+    "weld_centred_tilts_example": {
+      "note": "derived from the model (optical axis stays on the weld centre), not from a logged experiment",
+      "poses": [
+        {"tilt_deg": -20, "h_mm": 95.36},
+        {"tilt_deg": -10, "h_mm": 46.2},
+        {"tilt_deg": 10, "h_mm": -46.2},
+        {"tilt_deg": 20, "h_mm": -95.36}
+      ]
+    },
+    "real_experiment_poses": "none recorded yet: config/positions.yaml only holds placeholder step values, IMU checkpoints are empty"
+  },
+  "sources": [
+    {"item": "ring gear, carriage, pinion radius 104 mm, tilt range, lens_to_pivot 38 mm, optical axis through ring axis, UV dummy positions", "file": "Schwenkvorrichtung_komplett.stp (Solid Edge, BAM 2025) + drawings 24-24-1/-3/-4/-100", "certainty": "from CAD (+-1 mm); CAD shows the original 2-axis design, the camera carriage geometry is unchanged"},
+    {"item": "gear ratio 0.8 deg per motor revolution", "file": "CAD tooth count (120/16/60) + assumption 1-start worm (operator)", "certainty": "derived; real steps/deg comes from IMU auto-calibration"},
+    {"item": "working distance 300 mm", "file": "operator statement", "certainty": "estimate (~30 cm), to be measured"},
+    {"item": "specimen geometry", "file": "drawing 'Geometrie Stumpfstoss - ReNew' (BAM FB7.2, 14.10.2024)", "certainty": "from drawing; fillet radius estimated from the sketch"},
+    {"item": "linear stroke, limit switches", "file": "OAK-Drive-Sync config/sim_rig.yaml", "certainty": "PLACEHOLDER"},
+    {"item": "cam1 upside-down (image roll 180 deg)", "file": "OAK-Drive-Sync config/imu_calibration.yaml (reference_angle -90 vs +90)", "certainty": "inferred, verify against the real image"},
+    {"item": "model code", "file": "OAK-Drive-Sync src/sim/kinematics.py, config/sim_rig.yaml, docs/SIMULATION.md", "certainty": "unit-tested"}
+  ]
+}
