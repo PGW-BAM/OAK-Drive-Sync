@@ -39,9 +39,9 @@ cameras:
       travel_max: 52
       soft_margin: 1        # PLACEHOLDER
       switch_overtravel: 1  # PLACEHOLDER
-    fov:                    # PLACEHOLDER — gegen Datenblatt OAK-D 4 Pro + aktiven Sensor/Auflösung prüfen!
-      hfov_deg: 69
-      vfov_deg: 55
+    fov:                    # IMX586 @ 1920x1080: HFOV aus dem Mitsuba-Projekt (34_Mitsuba_Claude)
+      hfov_deg: 67.3        # Mitsuba-Projekt
+      vfov_deg: 41.06       # abgeleitet: 2*atan(tan(67.3/2) * 1080/1920), Pinhole ohne Verzeichnung
       width_px: 1920
       height_px: 1080
     imu:
@@ -69,9 +69,9 @@ cameras:
       travel_max: 52
       soft_margin: 1
       switch_overtravel: 1
-    fov:
-      hfov_deg: 69
-      vfov_deg: 55
+    fov:                    # wie cam1
+      hfov_deg: 67.3
+      vfov_deg: 41.06
       width_px: 1920
       height_px: 1080
     imu:

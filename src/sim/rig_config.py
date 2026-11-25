@@ -95,8 +95,8 @@ class AxisConfig(BaseModel):
 class FovConfig(BaseModel):
     """PLACEHOLDER values: verify against the OAK-D 4 Pro datasheet and the active sensor/mode."""
 
-    hfov_deg: float = Field(69.0, gt=0, lt=180)
-    vfov_deg: float = Field(55.0, gt=0, lt=180)
+    hfov_deg: float = Field(67.3, gt=0, lt=180)  # IMX586 @ 1080p (Mitsuba)
+    vfov_deg: float = Field(41.06, gt=0, lt=180)  # from HFOV + 16:9
     width_px: int = Field(1920, gt=0)
     height_px: int = Field(1080, gt=0)
 

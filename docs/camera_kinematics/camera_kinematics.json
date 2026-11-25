@@ -58,7 +58,7 @@
     "working_distance_mm": 300.0,
     "working_distance_definition": "optical centre -> flat front face along the optical axis at tilt 0",
     "note": "38 mm is measured in CAD from the ring axis to the front glass / centre lens of the OAK-D PoE enclosure (37.7-39.7 mm). The true entrance pupil of the IMX586 module lies a few mm further back (unknown). The Mitsuba setup uses 0.21 m; the operator gives ~0.30 m for current experiments - use the measured value of your reference photo.",
-    "camera_intrinsics_hint": "IMX586, 1920x1080, HFOV 67.3 deg per the Mitsuba project (the twin still uses a 69 x 55 deg placeholder)"
+    "camera_intrinsics_hint": "IMX586, 1920x1080, HFOV 67.3 deg per the Mitsuba project, VFOV 41.06 deg derived for 16:9 (the twin uses the same values)"
   },
   "pose_formula": {
     "pivot": "P = (s*(t/2 + WD - L), 0, h)",
