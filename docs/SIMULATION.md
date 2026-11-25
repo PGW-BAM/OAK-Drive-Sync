@@ -50,7 +50,8 @@ Vorderseite bei x = +t/2, Rückseite bei x = −t/2. Seite s = +1 (cam1) / −1 
 - Schweißwulst: cos²-Profil, 2 mm × 19 mm — bis Scan-Daten vorliegen
 - Achse a: `steps_per_unit` (200 steps/mm), Hub ±150 mm, Soft-Margin, Überlauf
 - Achse b: `steps_per_unit` = 2000 (aus Getriebe, wird durch Kalibrierung überschrieben); Soft-Margin/Überlauf
-- FOV 69° × 55°, 1920×1080 — gegen Datenblatt OAK-D 4 Pro und aktiven Sensor/Auflösung prüfen
+- FOV 67,3° × 41,06° bei 1920×1080 (IMX586): HFOV aus dem Mitsuba-Projekt, VFOV daraus über
+  16:9 abgeleitet (Pinhole, ohne Verzeichnung)
 - IMU-Einbau-Offset (cam1 −90°, cam2 +90° laut imu_calibration.yaml; am Aufbau prüfen) und
   Endschalter-Positionen (Design offen)
 - Lage der Linearschiene (200 mm hinter der Ringachse) und Halter Ring → Schiene geschätzt
